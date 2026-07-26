@@ -37,7 +37,7 @@ BASE_HEADERS = {
 }
 
 # ==========================================
-# توابع مربوط به توکن و APIهای اکالا
+# توابع مربوط به توکن و APIهای اکالا (با گزارش خطا)
 # ==========================================
 def get_tokens_from_file(file_path):
     access_token, refresh_token = None, None
@@ -100,10 +100,10 @@ async def api_get_address(token, uid):
     loop = asyncio.get_running_loop()
     try:
         res = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, params={'customerId': uid}, timeout=15))
-        if res.status_code == 200: return res.json()
-    except:
-        pass
-    return None
+        try: return res.status_code, res.json()
+        except: return res.status_code, res.text
+    except Exception as e:
+        return 0, str(e)
 
 async def api_get_stores(token, lat, lng, uid):
     url = 'https://apigateway.okala.com/api/Lucifer/v1/StoreRanking/GetAllStores'
@@ -113,10 +113,10 @@ async def api_get_stores(token, lat, lng, uid):
     loop = asyncio.get_running_loop()
     try:
         res = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, params=params, timeout=15))
-        if res.status_code == 200: return res.json()
-    except:
-        pass
-    return None
+        try: return res.status_code, res.json()
+        except: return res.status_code, res.text
+    except Exception as e:
+        return 0, str(e)
 
 async def api_get_cart(token, uid, store_ids):
     url = 'https://apigateway.okala.com/api/Basket/v2/ShoppingCart/GetCustomerShoppingCartItems'
@@ -126,10 +126,10 @@ async def api_get_cart(token, uid, store_ids):
     loop = asyncio.get_running_loop()
     try:
         res = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, params=params, timeout=15))
-        if res.status_code == 200: return res.json()
-    except:
-        pass
-    return None
+        try: return res.status_code, res.json()
+        except: return res.status_code, res.text
+    except Exception as e:
+        return 0, str(e)
 
 async def api_add_address(token, uid, addr_data):
     url = 'https://apigateway.okala.com/api/voyager/C/CustomerAccount/AddAddress/'
@@ -146,9 +146,10 @@ async def api_add_address(token, uid, addr_data):
     loop = asyncio.get_running_loop()
     try:
         res = await loop.run_in_executor(executor, lambda: requests.post(url, json=payload, headers=headers, timeout=15))
-        return res.status_code == 200
-    except:
-        return False
+        try: return res.status_code, res.json()
+        except: return res.status_code, res.text
+    except Exception as e:
+        return 0, str(e)
 
 async def api_add_to_cart(token, uid, store_id, product_id):
     url = 'https://apigateway.okala.com/api/Basket/v2/ShoppingCart/AddToShoppingCart'
@@ -283,7 +284,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ===================================================
-        # حالت سوم: کپی واقعی آدرس و سبد خرید از اکانت الگو به بقیه
+        # حالت سوم: کپی واقعی آدرس و سبد خرید
         # ===================================================
         if action == 'zip_sync_cart':
             await msg.edit_text("🛒 در حال استخراج اطلاعات از اکانت الگو (نفر اول)...")
@@ -300,26 +301,43 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t_uid = get_user_id_from_token(t_acc)
                 
             if not t_uid:
-                await msg.edit_text("❌ توکن اکانت الگو (نفر اول) نامعتبر یا منقضی است.")
+                await msg.edit_text("❌ توکن اکانت الگو (نفر اول) نامعتبر یا استخراج آیدی (t_uid) ناموفق بود.")
                 return
 
-            # ۱. گرفتن آدرس اکانت الگو از سرور
-            addr_res = await api_get_address(t_acc, t_uid)
-            if not addr_res or not addr_res.get('data'):
-                await msg.edit_text("❌ اکانت الگو فاقد آدرس ثبت‌شده در سرور است.")
+            # ۱. گرفتن آدرس اکانت الگو
+            status, addr_res = await api_get_address(t_acc, t_uid)
+            if status != 200 or not isinstance(addr_res, dict) or not addr_res.get('data') or len(addr_res.get('data', [])) == 0:
+                error_msg = (
+                    f"❌ **خطا در دریافت آدرس اکانت الگو ({template_file})**\n\n"
+                    f"وضعیت (Status): `{status}`\n"
+                    f"آیدی کاربر: `{t_uid}`\n"
+                    f"پاسخ سرور: \n`{str(addr_res)[:300]}`"
+                )
+                await msg.edit_text(error_msg, parse_mode='Markdown')
                 return
             template_addr = addr_res['data'][0]
 
-            # ۲. گرفتن فروشگاه‌ها و سبد خرید اکانت الگو از سرور
-            stores_res = await api_get_stores(t_acc, template_addr['lat'], template_addr['lng'], t_uid)
-            if not stores_res or not stores_res.get('data', {}).get('stores'):
-                await msg.edit_text("❌ هیچ فروشگاهی برای آدرس اکانت الگو پیدا نشد.")
+            # ۲. گرفتن فروشگاه‌ها
+            status, stores_res = await api_get_stores(t_acc, template_addr['lat'], template_addr['lng'], t_uid)
+            if status != 200 or not isinstance(stores_res, dict) or not stores_res.get('data', {}).get('stores'):
+                error_msg = (
+                    f"❌ **خطا در دریافت لیست فروشگاه‌ها**\n\n"
+                    f"وضعیت (Status): `{status}`\n"
+                    f"پاسخ سرور: \n`{str(stores_res)[:300]}`"
+                )
+                await msg.edit_text(error_msg, parse_mode='Markdown')
                 return
             store_ids = [s['storeId'] for s in stores_res['data']['stores']]
 
-            cart_res = await api_get_cart(t_acc, t_uid, store_ids)
-            if not cart_res or not cart_res.get('data', {}).get('result'):
-                await msg.edit_text("❌ سبد خرید اکانت الگو خالی است یا اطلاعات آن دریافت نشد.")
+            # ۳. گرفتن سبد خرید
+            status, cart_res = await api_get_cart(t_acc, t_uid, store_ids)
+            if status != 200 or not isinstance(cart_res, dict) or not cart_res.get('data', {}).get('result'):
+                error_msg = (
+                    f"❌ **خطا در دریافت سبد خرید الگو**\n\n"
+                    f"وضعیت (Status): `{status}`\n"
+                    f"پاسخ سرور: \n`{str(cart_res)[:300]}`"
+                )
+                await msg.edit_text(error_msg, parse_mode='Markdown')
                 return
 
             cart_data = cart_res['data']['result'][0]
@@ -327,13 +345,14 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cart_store_id = cart_data.get('storeId')
 
             if not cart_items:
-                await msg.edit_text("❌ سبد خرید اکانت الگو خالی است!")
+                await msg.edit_text("❌ سبد خرید اکانت الگو در سرور خالی است! لطفاً ابتدا اجناس را اضافه کنید.")
                 return
 
-            await msg.edit_text(f"🎯 اطلاعات الگو دریافت شد. در حال اعمال روی {len(target_files)} اکانت دیگر در سرور اکالا...")
+            await msg.edit_text(f"🎯 اطلاعات الگو با موفقیت دریافت شد. در حال اعمال روی {len(target_files)} اکانت دیگر در سرور اکالا...")
 
             links_text = f"🛒 **گزارش کپی سبد و آدرس (الگو: {template_file}):**\n\n"
             count = 0
+            err_count = 0
 
             for filename in target_files:
                 file_path = os.path.join(src_accounts, filename)
@@ -350,10 +369,16 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if not uid: continue
 
-                # الف) ثبت آدرس در سرور برای اکانت هدف
-                address_success = await api_add_address(acc_token, uid, template_addr)
+                # ثبت آدرس
+                status, addr_add_res = await api_add_address(acc_token, uid, template_addr)
+                address_success = (status == 200)
                 
-                # ب) افزودن کالاها به سبد خرید در سرور برای اکانت هدف
+                if not address_success:
+                    logging.error(f"Error adding address to {filename}: Status {status}, Res: {addr_add_res}")
+                    err_count += 1
+                    continue
+
+                # افزودن به سبد
                 added_ok = 0
                 if address_success and cart_store_id:
                     for item in cart_items:
@@ -362,7 +387,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if ok: added_ok += 1
                             await asyncio.sleep(0.3)
 
-                # ج) ساخت لینک اختصاصی برای اکانت هدف
+                # ساخت لینک
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         file_content = f.read()
@@ -380,13 +405,14 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+            report = f"✅ عملیات روی {count} اکانت انجام شد. (خطاها: {err_count})"
             if len(links_text) > 4000:
                 file_out = io.BytesIO(links_text.encode('utf-8'))
                 file_out.name = f"Synced_Cart_Links_{int(time.time())}.txt"
-                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ عملیات روی {count} اکانت در سرور انجام شد.")
+                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=report)
                 await msg.delete()
             else:
-                await msg.edit_text(f"✅ عملیات با موفقیت انجام شد:\n\n{links_text}", disable_web_page_preview=True)
+                await msg.edit_text(f"{report}\n\n{links_text}", disable_web_page_preview=True)
 
         # ===================================================
         # حالت اول: فقط تولید لینک
@@ -719,7 +745,7 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    logging.info("🚀 Server is live with Real Server Cart Sync...")
+    logging.info("🚀 Server is live with Enhanced Error Logging...")
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
