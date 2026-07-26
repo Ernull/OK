@@ -10,7 +10,6 @@ import base64
 import tempfile
 import shutil
 import requests
-import random
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
@@ -92,80 +91,6 @@ def api_refresh_token(refresh_token):
     except:
         pass
     return None, None
-
-async def api_get_address(token, uid):
-    url = 'https://apigateway.okala.com/api/voyager/CustomerAddress/CustomerAddressForReact'
-    headers = BASE_HEADERS.copy()
-    headers['Authorization'] = f'Bearer {token}'
-    loop = asyncio.get_running_loop()
-    try:
-        res = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, params={'customerId': uid}, timeout=15))
-        try: return res.status_code, res.json()
-        except: return res.status_code, res.text
-    except Exception as e:
-        return 0, str(e)
-
-async def api_get_stores(token, lat, lng, uid):
-    url = 'https://apigateway.okala.com/api/Lucifer/v1/StoreRanking/GetAllStores'
-    headers = BASE_HEADERS.copy()
-    headers['Authorization'] = f'Bearer {token}'
-    params = {'latitude': lat, 'longitude': lng, 'CustomerId': uid, 'IsMsBasketEnable': 'true'}
-    loop = asyncio.get_running_loop()
-    try:
-        res = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, params=params, timeout=15))
-        try: return res.status_code, res.json()
-        except: return res.status_code, res.text
-    except Exception as e:
-        return 0, str(e)
-
-async def api_get_cart(token, uid, store_ids):
-    url = 'https://apigateway.okala.com/api/Basket/v2/ShoppingCart/GetCustomerShoppingCartItems'
-    headers = BASE_HEADERS.copy()
-    headers['Authorization'] = f'Bearer {token}'
-    params = {'CustomerId': uid, 'StoreIds': store_ids, 'isFromCartPage': 'false'}
-    loop = asyncio.get_running_loop()
-    try:
-        res = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, params=params, timeout=15))
-        try: return res.status_code, res.json()
-        except: return res.status_code, res.text
-    except Exception as e:
-        return 0, str(e)
-
-async def api_add_address(token, uid, addr_data):
-    url = 'https://apigateway.okala.com/api/voyager/C/CustomerAccount/AddAddress/'
-    payload = {
-        'id': 0, 'customerId': uid, 'mobilePhone': '', 'ShoppingSectorPartId': '0',
-        'shoppingSectorId': '0', 'plaque': str(addr_data.get('plaque', '0')), 
-        'unit': str(addr_data.get('unit', '1')), 'lat': float(addr_data.get('lat', 0)),
-        'lng': float(addr_data.get('lng', 0)), 'title': None, 'addressTypeId': 3, 
-        'oprationDuration': random.randint(10000, 20000), 
-        'address': addr_data.get('address', 'آدرس ثبت شده'), 'mapPlatform': 'ParsiMap'
-    }
-    headers = BASE_HEADERS.copy()
-    headers['Authorization'] = f'Bearer {token}'
-    loop = asyncio.get_running_loop()
-    try:
-        res = await loop.run_in_executor(executor, lambda: requests.post(url, json=payload, headers=headers, timeout=15))
-        try: return res.status_code, res.json()
-        except: return res.status_code, res.text
-    except Exception as e:
-        return 0, str(e)
-
-async def api_add_to_cart(token, uid, store_id, product_id):
-    url = 'https://apigateway.okala.com/api/Basket/v2/ShoppingCart/AddToShoppingCart'
-    payload = {
-        'storeId': store_id, 'customerId': uid, 'productId': product_id, 'quantity': 1,
-        'isSupplier': False, 'replaceItemMethodCode': -1, 'sectorId': '0', 'sectorPartId': '0',
-        'productStoreId': '0', 'queryId': None
-    }
-    headers = BASE_HEADERS.copy()
-    headers['Authorization'] = f'Bearer {token}'
-    loop = asyncio.get_running_loop()
-    try:
-        res = await loop.run_in_executor(executor, lambda: requests.post(url, json=payload, headers=headers, timeout=15))
-        return res.status_code == 200
-    except:
-        return False
 
 async def process_discounts_and_send_report(bot, acc_keys):
     report_text = "گزارش کدهای تخفیف (دیتابیس):\n\n"
@@ -283,114 +208,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("هیچ فایل JSON معتبری در پوشه یافت نشد.")
             return
 
-        if action == 'zip_sync_cart':
-            await msg.edit_text("در حال جستجوی اکانت مرجع (دارای آدرس)...")
-            
-            template_file = None
-            template_addr = None
-            cart_items = []
-            cart_store_id = None
-            
-            for filename in json_files:
-                file_path = os.path.join(src_accounts, filename)
-                acc_token, ref_token = get_tokens_from_file(file_path)
-                if not acc_token: continue
-                
-                uid = get_user_id_from_token(acc_token)
-                if not uid and ref_token:
-                    acc_token, ref_token = api_refresh_token(ref_token)
-                    uid = get_user_id_from_token(acc_token)
-                    if acc_token: update_file_with_new_tokens(file_path, acc_token, acc_token, ref_token, ref_token)
-                if not uid: continue
-                
-                status, addr_res = await api_get_address(acc_token, uid)
-                if status == 200 and isinstance(addr_res, dict) and addr_res.get('data') and len(addr_res['data']) > 0:
-                    template_file = filename
-                    template_addr = addr_res['data'][0]
-                    
-                    status, stores_res = await api_get_stores(acc_token, template_addr['lat'], template_addr['lng'], uid)
-                    if status == 200 and isinstance(stores_res, dict) and stores_res.get('data', {}).get('stores'):
-                        store_ids = [s['storeId'] for s in stores_res['data']['stores']]
-                        status, cart_res = await api_get_cart(acc_token, uid, store_ids)
-                        if status == 200 and isinstance(cart_res, dict) and cart_res.get('data', {}).get('result'):
-                            c_data = cart_res['data']['result'][0]
-                            cart_items = c_data.get('items', [])
-                            cart_store_id = c_data.get('storeId')
-                    
-                    break
-                    
-            if not template_file:
-                await msg.edit_text("عملیات ناموفق: هیچ‌یک از اکانت‌های موجود دارای آدرس ثبت‌شده نبودند.")
-                return
-                
-            if not cart_items:
-                await msg.edit_text(f"اکانت مرجع یافت شد ({template_file}) اما سبد خرید آن خالی است.")
-                return
-
-            target_files = [f for f in json_files if f != template_file]
-            await msg.edit_text(f"الگوی معتبر یافت شد: {template_file}\nدر حال اعمال تغییرات روی {len(target_files)} اکانت...")
-
-            links_text = f"گزارش عملیات کپی (مرجع: {template_file}):\n\n"
-            count = 0
-            err_count = 0
-
-            for filename in target_files:
-                file_path = os.path.join(src_accounts, filename)
-                acc_token, ref_token = get_tokens_from_file(file_path)
-                if not acc_token: continue
-                
-                uid = get_user_id_from_token(acc_token)
-                if not uid and ref_token:
-                    new_acc, new_ref = api_refresh_token(ref_token)
-                    if new_acc:
-                        update_file_with_new_tokens(file_path, acc_token, new_acc, ref_token, new_ref)
-                        acc_token = new_acc
-                        uid = get_user_id_from_token(acc_token)
-
-                if not uid: continue
-
-                status, addr_add_res = await api_add_address(acc_token, uid, template_addr)
-                address_success = (status == 200)
-                
-                if not address_success:
-                    err_count += 1
-                    continue
-
-                added_ok = 0
-                if address_success and cart_store_id:
-                    for item in cart_items:
-                        for _ in range(item.get('quantity', 1)):
-                            ok = await api_add_to_cart(acc_token, uid, cart_store_id, item.get('productId'))
-                            if ok: added_ok += 1
-                            await asyncio.sleep(0.3)
-
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                        phone = filename.replace('.json', '')
-                        
-                        if acc_token and not await redis_client.exists(f"account:{phone}"):
-                            await redis_client.hset(f"account:{phone}", mapping={"access_token": acc_token, "refresh_token": ref_token or ""})
-                        
-                        link_id = str(uuid.uuid4())[:12]
-                        await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
-                        
-                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                        links_text += f"شماره {phone} (کالای اضافه شده: {added_ok}):\n{final_url}\n\n"
-                        count += 1
-                except Exception:
-                    pass
-
-            report = f"عملیات برای {count} اکانت با موفقیت انجام شد. (خطاها: {err_count})"
-            if len(links_text) > 4000:
-                file_out = io.BytesIO(links_text.encode('utf-8'))
-                file_out.name = f"Synced_Links_{int(time.time())}.txt"
-                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=report)
-                await msg.delete()
-            else:
-                await msg.edit_text(f"{report}\n\n{links_text}", disable_web_page_preview=True)
-
-        elif action == 'zip_to_link':
+        if action == 'zip_to_link':
             links_text = "لیست لینک‌های تولید شده:\n\n"
             count = 0
             for filename in json_files:
@@ -510,7 +328,6 @@ def get_admin_keyboard():
         [InlineKeyboardButton("آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("تنظیم انقضا", callback_data="admin_expire")],
         [InlineKeyboardButton("بررسی تخفیف دیتابیس", callback_data="admin_check_discounts")],
         [InlineKeyboardButton("تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
-        [InlineKeyboardButton("کپی سبد و آدرس (الگو)", callback_data="admin_zip_sync_cart")],
         [InlineKeyboardButton("استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("پاکسازی دیتابیس", callback_data="admin_clear")],
         [InlineKeyboardButton("روشن/خاموش کردن", callback_data="admin_toggle")],
         [InlineKeyboardButton("بازگشت به منوی اصلی", callback_data="main_menu")]
@@ -585,10 +402,6 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_zip_discount":
         context.user_data['admin_zip_action'] = 'zip_discount_check'
         await query.message.reply_text("عملیات بررسی تخفیف:\nلطفا فایل مربوطه را ارسال کنید.")
-        
-    elif data == "admin_zip_sync_cart":
-        context.user_data['admin_zip_action'] = 'zip_sync_cart'
-        await query.message.reply_text("عملیات کپی سبد و آدرس:\nلطفا فایل حاوی اکانت‌ها را ارسال کنید. سیستم به صورت خودکار اکانت دارای آدرس را شناسایی کرده و تغییرات را اعمال می‌کند.")
 
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
