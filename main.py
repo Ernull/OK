@@ -22,7 +22,9 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) 
+
+# 📌 خواندن لیست آیدی‌های ادمین از متغیر محیطی (جدا شده با کاما)
+ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
 
 PHONE, OTP, ASK_NAME = range(3)
 executor = ThreadPoolExecutor(max_workers=10)
@@ -34,6 +36,9 @@ BASE_HEADERS = {
     'origin': 'https://www.okala.com',
     'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
 }
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
 # ==========================================
 # توابع مربوط به توکن و APIهای سیستم
@@ -76,23 +81,7 @@ def get_user_id_from_token(token):
     except Exception:
         return 0
 
-def api_refresh_token(refresh_token):
-    url = "https://apigateway.okala.com/api/v1/accounts/tokens"
-    data = {
-        "grant_type": "refresh_token", "client_id": "customer_client_id",
-        "client_secret": "u_M{'57j!%LI21#", "scope": "offline_access", "refresh_token": refresh_token
-    }
-    headers = {"content-type": "application/x-www-form-urlencoded"}
-    try:
-        res = requests.post(url, data=data, headers=headers, timeout=10)
-        if res.status_code == 200:
-            d = res.json()
-            return d.get('access_token'), d.get('refresh_token')
-    except:
-        pass
-    return None, None
-
-async def process_discounts_and_send_report(bot, acc_keys):
+async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     report_text = "گزارش کدهای تخفیف (دیتابیس):\n\n"
     found_any = False
     for key in acc_keys:
@@ -120,9 +109,9 @@ async def process_discounts_and_send_report(bot, acc_keys):
     if len(report_text) > 4000:
         file_out = io.BytesIO(report_text.encode('utf-8'))
         file_out.name = f"Discounts_Report_{int(time.time())}.txt"
-        await bot.send_document(chat_id=ADMIN_ID, document=file_out, caption="گزارش کامل تخفیف‌ها")
+        await bot.send_document(chat_id=chat_id, document=file_out, caption="گزارش کامل تخفیف‌ها")
     else:
-        await bot.send_message(chat_id=ADMIN_ID, text=report_text)
+        await bot.send_message(chat_id=chat_id, text=report_text)
 
 # ==========================================
 # تبدیل دیتا برای وب
@@ -171,7 +160,8 @@ def format_for_injector(auth_data):
 # پردازش فایل زیپ
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    user_id = update.effective_user.id
+    if not is_admin(user_id): return
     
     file_name = update.message.document.file_name.lower()
     if not file_name.endswith('.zip'):
@@ -239,7 +229,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(links_text) > 4000:
                 file_out = io.BytesIO(links_text.encode('utf-8'))
                 file_out.name = f"Links_{int(time.time())}.txt"
-                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"استخراج {count} اکانت انجام شد.")
+                await context.bot.send_document(chat_id=user_id, document=file_out, caption=f"استخراج {count} اکانت انجام شد.")
                 await msg.delete()
             else:
                 await msg.edit_text(f"تعداد {count} اکانت ذخیره شد:\n\n{links_text}", disable_web_page_preview=True)
@@ -285,13 +275,13 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
                 await msg.delete()
                 with open(discount_zip_path + '.zip', 'rb') as zip_file:
-                    await context.bot.send_document(chat_id=ADMIN_ID, document=zip_file, caption=f"فایل خروجی (فیلتر شده)\nتعداد اکانت‌های دارای تخفیف: {discount_count}")
+                    await context.bot.send_document(chat_id=user_id, document=zip_file, caption=f"فایل خروجی (فیلتر شده)\nتعداد اکانت‌های دارای تخفیف: {discount_count}")
                 if len(links_text) > 4000:
                     file_out = io.BytesIO(links_text.encode('utf-8'))
                     file_out.name = f"Discount_Links_{int(time.time())}.txt"
-                    await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption="لینک‌های دسترسی سریع")
+                    await context.bot.send_document(chat_id=user_id, document=file_out, caption="لینک‌های دسترسی سریع")
                 else:
-                    await context.bot.send_message(chat_id=ADMIN_ID, text=links_text, disable_web_page_preview=True)
+                    await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True)
             else:
                 await msg.edit_text("هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
 
@@ -317,9 +307,9 @@ async def start_web_server():
 # ==========================================
 # منوها و دکمه‌ها
 # ==========================================
-def get_main_keyboard(is_admin):
+def get_main_keyboard(is_admin_user):
     keyboard = [[InlineKeyboardButton("ورود به حساب", callback_data="user_login")]]
-    if is_admin:
+    if is_admin_user:
         keyboard.append([InlineKeyboardButton("پنل مدیریت", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -335,28 +325,30 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_admin = (update.effective_user.id == ADMIN_ID)
+    user_id = update.effective_user.id
+    admin_status = is_admin(user_id)
     text = "به سیستم مدیریت حساب خوش آمدید.\nلطفا یک گزینه را انتخاب کنید:"
     if update.message:
-        await update.message.reply_text(text, reply_markup=get_main_keyboard(is_admin))
+        await update.message.reply_text(text, reply_markup=get_main_keyboard(admin_status))
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=get_main_keyboard(is_admin))
+        await update.callback_query.edit_message_text(text, reply_markup=get_main_keyboard(admin_status))
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if not is_admin(update.effective_user.id): return
     context.user_data['admin_zip_action'] = None
     await update.message.reply_text("پنل مدیریت سیستم:", reply_markup=get_admin_keyboard())
 
 async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
     data = query.data
     
     if data == "main_menu":
         await show_main_menu(update, context)
         return
         
-    if query.from_user.id != ADMIN_ID: return
+    if not is_admin(user_id): return
     
     if data == "admin_panel":
         context.user_data['admin_zip_action'] = None
@@ -393,7 +385,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("دیتابیس سیستم خالی است.")
             return
         await query.message.reply_text("در حال پردازش اطلاعات. لطفا منتظر بمانید...")
-        asyncio.create_task(process_discounts_and_send_report(context.bot, acc_keys))
+        asyncio.create_task(process_discounts_and_send_report(context.bot, user_id, acc_keys))
         
     elif data == "admin_zip_to_link":
         context.user_data['admin_zip_action'] = 'zip_to_link'
@@ -412,7 +404,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in acc_keys: export_text += f"{key.replace('account:', '')}\n"
         file_out = io.BytesIO(export_text.encode('utf-8'))
         file_out.name = f"Accounts_{int(time.time())}.txt"
-        await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption="فایل دیتابیس دریافت شد.")
+        await context.bot.send_document(chat_id=user_id, document=file_out, caption="فایل دیتابیس دریافت شد.")
         
     elif data == "admin_clear":
         kb = [[InlineKeyboardButton("تایید عملیات حذف", callback_data="admin_clear_confirm"), InlineKeyboardButton("انصراف", callback_data="admin_panel")]]
@@ -449,7 +441,8 @@ def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_maintenance(update: Update) -> bool:
     maint = await redis_client.get("settings:maintenance")
-    if maint == "1" and update.effective_user.id != ADMIN_ID:
+    user_id = update.effective_user.id if update.effective_user else 0
+    if maint == "1" and not is_admin(user_id):
         if update.message:
             await update.message.reply_text("سیستم در حال حاضر موقتا غیرفعال است.")
         else:
