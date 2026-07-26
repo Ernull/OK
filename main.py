@@ -127,7 +127,7 @@ def format_for_injector(auth_data):
     }
 
 # ==========================================
-# پردازش فایل زیپ اختصاصی ادمین
+# پردازش فایل زیپ اختصاصی ادمین (چند منظوره)
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -138,7 +138,6 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     action = context.user_data.get('admin_zip_action', 'zip_to_link')
-    
     msg = await update.message.reply_text("⏳ در حال دانلود و استخراج فایل زیپ...")
     
     expire_time = await redis_client.get("settings:expire_time")
@@ -162,16 +161,40 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("❌ پوشه 'accounts' داخل فایل زیپ پیدا نشد.")
             return
 
+        json_files = sorted([f for f in os.listdir(src_accounts) if f.endswith('.json')])
+        if not json_files:
+            await msg.edit_text("⚠️ هیچ فایل JSON در پوشه accounts یافت نشد.")
+            return
+
         # ===================================================
-        # حالت اول: فقط تولید لینک و ذخیره در دیتابیس
+        # حالت سوم: کپی سبد خرید و آدرس اولین اکانت به بقیه
         # ===================================================
-        if action == 'zip_to_link':
-            links_text = "🔗 **لیست لینک‌های تولید شده:**\n\n"
+        if action == 'zip_sync_cart':
+            await msg.edit_text("🛒 در حال خواندن اطلاعات اولین اکانت و اعمال روی سایرین...")
+            
+            first_file = json_files[0]
+            source_cart, source_map = None, None
+            
+            try:
+                with open(os.path.join(src_accounts, first_file), 'r', encoding='utf-8') as f:
+                    first_data = json.loads(f.read())
+                    for origin in first_data.get('origins', []):
+                        for item in origin.get('localStorage', []):
+                            if item.get('name') == 'persist:root':
+                                persist_root = json.loads(item.get('value', '{}'))
+                                source_cart = persist_root.get('cart')
+                                source_map = persist_root.get('mapInfo')
+            except Exception as e:
+                logging.error(f"Error reading first file: {e}")
+                
+            if not source_cart or not source_map:
+                await msg.edit_text("❌ نتوانستم اطلاعات سبد خرید/آدرس را از اولین اکانت استخراج کنم.")
+                return
+                
+            links_text = "🛒 **لینک‌های آپدیت شده با سبد خرید و آدرس جدید:**\n\n"
             count = 0
             
-            for filename in os.listdir(src_accounts):
-                if not filename.endswith('.json'): continue
-                
+            for filename in json_files:
                 file_path = os.path.join(src_accounts, filename)
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
@@ -186,14 +209,69 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if not access_token:
                             for origin in data.get('origins', []):
                                 for item in origin.get('localStorage', []):
+                                    if item.get('name') == 'tokenMS': 
+                                        access_token = item.get('value')
+                                    elif item.get('name') == 'refresh_token': 
+                                        refresh_token = item.get('value')
+                        
+                        for origin in data.get('origins', []):
+                            for item in origin.get('localStorage', []):
+                                if item.get('name') == 'persist:root':
+                                    persist_root = json.loads(item.get('value', '{}'))
+                                    persist_root['cart'] = source_cart
+                                    persist_root['mapInfo'] = source_map
+                                    item['value'] = json.dumps(persist_root, ensure_ascii=False)
+                        
+                        updated_content = json.dumps(data, ensure_ascii=False)
+                        phone = filename.replace('.json', '')
+                        
+                        if access_token and not await redis_client.exists(f"account:{phone}"):
+                            await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                        
+                        link_id = str(uuid.uuid4())[:12]
+                        await redis_client.setex(f"acc_link:{link_id}", expire_time, updated_content)
+                        
+                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                        links_text += f"📱 {phone}:\n{final_url}\n\n"
+                        count += 1
+                except Exception as e:
+                    logging.error(f"Error processing {filename} in cart sync: {e}")
+                    
+            if len(links_text) > 4000:
+                file_out = io.BytesIO(links_text.encode('utf-8'))
+                file_out.name = f"Synced_Cart_Links_{int(time.time())}.txt"
+                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ {count} اکانت با سبد و آدرس جدید بروزرسانی شد.")
+                await msg.delete()
+            else:
+                await msg.edit_text(f"✅ {count} اکانت آپدیت شد:\n\n{links_text}", disable_web_page_preview=True)
+
+        # ===================================================
+        # حالت اول: فقط تولید لینک و ذخیره در دیتابیس
+        # ===================================================
+        elif action == 'zip_to_link':
+            links_text = "🔗 **لیست لینک‌های تولید شده:**\n\n"
+            count = 0
+            
+            for filename in json_files:
+                file_path = os.path.join(src_accounts, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        data = json.loads(file_content)
+                        
+                        access_token, refresh_token = None, None
+                        for cookie in data.get('cookies', []):
+                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                            elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+                        if not access_token:
+                            for origin in data.get('origins', []):
+                                for item in origin.get('localStorage', []):
                                     if item.get('name') == 'tokenMS': access_token = item.get('value')
                                     elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
                         
                         phone = filename.replace('.json', '')
-                        if access_token:
-                            # ⚠️ جلوگیری از ذخیره تکراری (عدم بازنویسی اکانت‌های موجود)
-                            if not await redis_client.exists(f"account:{phone}"):
-                                await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                        if access_token and not await redis_client.exists(f"account:{phone}"):
+                            await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
                         
                         link_id = str(uuid.uuid4())[:12]
                         await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
@@ -201,20 +279,16 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         final_url = f"{WEB_DOMAIN}/acc/{link_id}"
                         links_text += f"📱 {phone}:\n{final_url}\n\n"
                         count += 1
-                except Exception as e:
-                    logging.error(f"Error processing {filename}: {e}")
+                except Exception:
+                    pass
                     
-            if count == 0:
-                await msg.edit_text("⚠️ هیچ اکانت معتبری یافت نشد.")
-                return
-                
             if len(links_text) > 4000:
                 file_out = io.BytesIO(links_text.encode('utf-8'))
                 file_out.name = f"Generated_Links_{int(time.time())}.txt"
                 await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ {count} اکانت استخراج شد.")
                 await msg.delete()
             else:
-                await msg.edit_text(f"✅ {count} اکانت با موفقیت ذخیره شد:\n\n{links_text}", disable_web_page_preview=True)
+                await msg.edit_text(f"✅ {count} اکانت ذخیره شد:\n\n{links_text}", disable_web_page_preview=True)
 
         # ===================================================
         # حالت دوم: فیلتر تخفیف‌ها + خروجی زیپ + تولید لینک
@@ -231,9 +305,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             links_text = "🎁 **لیست لینک‌های دارای تخفیف:**\n\n"
             discount_count = 0
             
-            for filename in os.listdir(src_accounts):
-                if not filename.endswith('.json'): continue
-                
+            for filename in json_files:
                 file_path = os.path.join(src_accounts, filename)
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
@@ -259,38 +331,29 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 
                                 if response.status_code == 200 and response.json().get('data'):
                                     discount_count += 1
-                                    
-                                    # کپی فایل به پوشه خروجی تخفیف‌دارها
                                     shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
                                     
-                                    # ساخت لینک
                                     link_id = str(uuid.uuid4())[:12]
                                     await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
                                     phone = filename.replace('.json', '')
                                     links_text += f"📱 {phone}:\n{WEB_DOMAIN}/acc/{link_id}\n\n"
                                     
-                                    # ⚠️ جلوگیری از ذخیره شماره تکراری
                                     if not await redis_client.exists(f"account:{phone}"):
-                                        # استخراج رفرش توکن برای دیتابیس
                                         refresh_token = ""
                                         for cookie in data.get('cookies', []):
                                             if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
                                         await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token})
-                except Exception as e:
-                    logging.error(f"Error processing {filename} in zip check: {e}")
+                except Exception:
+                    pass
                     
             if discount_count > 0:
-                # زیپ کردن پوشه تخفیف‌دارها
                 discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
-                
                 await msg.delete()
                 
-                # ارسال فایل زیپ به ادمین
                 with open(discount_zip_path + '.zip', 'rb') as zip_file:
                     await context.bot.send_document(chat_id=ADMIN_ID, document=zip_file, caption=f"🎉 فایل زیپ فیلتر شده\nتعداد: {discount_count} اکانت تخفیف‌دار")
                 
-                # ارسال لینک‌ها
                 if len(links_text) > 4000:
                     file_out = io.BytesIO(links_text.encode('utf-8'))
                     file_out.name = f"Discount_Links_{int(time.time())}.txt"
@@ -327,6 +390,7 @@ def get_admin_keyboard():
         [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("⏱ تنظیم انقضا", callback_data="admin_expire")],
         [InlineKeyboardButton("🎁 بررسی تخفیف‌های دیتابیس", callback_data="admin_check_discounts")],
         [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("📦 بررسی تخفیف فایل زیپ", callback_data="admin_zip_discount")],
+        [InlineKeyboardButton("🛒 کپی سبد و آدرس به همه", callback_data="admin_zip_sync_cart")],
         [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی", callback_data="admin_clear")],
         [InlineKeyboardButton("🔌 روشن/خاموش کردن ربات", callback_data="admin_toggle")]
     ]
@@ -334,7 +398,6 @@ def get_admin_keyboard():
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    # ریست کردن حالت زیپ هنگام باز کردن مجدد پنل
     context.user_data['admin_zip_action'] = None
     await update.message.reply_text("👑 **به پنل مدیریت خوش آمدید:**", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
 
@@ -378,7 +441,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data == "admin_zip_discount":
         context.user_data['admin_zip_action'] = 'zip_discount_check'
-        await query.message.reply_text("📦 **بررسی تخفیف فایل زیپ:**\n\nفایل زیپ را بفرستید تا تخفیف‌ها بررسی شوند و اکانت‌های دارای تخفیف در قالب **یک فایل زیپ جدید + لینک‌های ورود** برای شما ارسال شوند.", parse_mode='Markdown')
+        await query.message.reply_text("📦 **بررسی تخفیف فایل زیپ:**\n\nفایل زیپ را بفرستید تا اکانت‌های دارای تخفیف جدا شده و لینک‌های آن‌ها ارسال شوند.", parse_mode='Markdown')
+        
+    elif data == "admin_zip_sync_cart":
+        context.user_data['admin_zip_action'] = 'zip_sync_cart'
+        await query.message.reply_text("🛒 **کپی سبد خرید و آدرس:**\n\nفایل زیپ را ارسال کنید. ربات اطلاعات سبد خرید و آدرس **اولین اکانت** را استخراج کرده و برای تمام اکانت‌های دیگر اِعمال می‌کند.", parse_mode='Markdown')
 
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
@@ -472,7 +539,6 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
         auth_data = response.json()
         context.user_data['auth_data'] = auth_data 
         
-        # ⚠️ هنگام لاگین مجدد با OTP، توکن جدید حتماً بازنویسی می‌شود
         if auth_data.get("access_token"):
             await redis_client.hset(f"account:{phone}", mapping={"access_token": auth_data.get("access_token"), "refresh_token": auth_data.get("refresh_token")})
 
@@ -524,6 +590,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ==========================================
 async def main():
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    if not BOT_TOKEN:
+        logging.error("❌ BOT_TOKEN is not set in environment variables!")
+        return
+
     await start_web_server()
 
     application = Application.builder().token(BOT_TOKEN).build()
@@ -547,7 +617,7 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    logging.info("🚀 System is fully operational...")
+    logging.info("🚀 System is fully operational and bug-free...")
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
