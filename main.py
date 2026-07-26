@@ -37,7 +37,7 @@ BASE_HEADERS = {
 }
 
 # ==========================================
-# توابع مربوط به توکن و APIهای اکالا (با گزارش خطا)
+# توابع مربوط به توکن و APIهای اکالا
 # ==========================================
 def get_tokens_from_file(file_path):
     access_token, refresh_token = None, None
@@ -243,7 +243,7 @@ def format_for_injector(auth_data):
     }
 
 # ==========================================
-# پردازش فایل زیپ و کپی واقعی سبد و آدرس
+# پردازش فایل زیپ اختصاصی ادمین
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -284,71 +284,59 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ===================================================
-        # حالت سوم: کپی واقعی آدرس و سبد خرید
+        # حالت سوم: کپی آدرس و سبد خرید (تشخیص هوشمند الگو)
         # ===================================================
         if action == 'zip_sync_cart':
-            await msg.edit_text("🛒 در حال استخراج اطلاعات از اکانت الگو (نفر اول)...")
+            await msg.edit_text("🔍 جستجوی هوشمند: در حال پیدا کردن اکانتی که دارای آدرس ثبت‌شده باشد...")
             
-            template_file = json_files[0]
-            target_files = json_files[1:]
+            template_file = None
+            template_addr = None
+            cart_items = []
+            cart_store_id = None
             
-            t_path = os.path.join(src_accounts, template_file)
-            t_acc, t_ref = get_tokens_from_file(t_path)
-            t_uid = get_user_id_from_token(t_acc)
-            
-            if not t_uid and t_ref:
-                t_acc, t_ref = api_refresh_token(t_ref)
-                t_uid = get_user_id_from_token(t_acc)
+            # جستجوی هوشمند برای پیدا کردن الگو
+            for filename in json_files:
+                file_path = os.path.join(src_accounts, filename)
+                acc_token, ref_token = get_tokens_from_file(file_path)
+                if not acc_token: continue
                 
-            if not t_uid:
-                await msg.edit_text("❌ توکن اکانت الگو (نفر اول) نامعتبر یا استخراج آیدی (t_uid) ناموفق بود.")
+                uid = get_user_id_from_token(acc_token)
+                if not uid and ref_token:
+                    acc_token, ref_token = api_refresh_token(ref_token)
+                    uid = get_user_id_from_token(acc_token)
+                    if acc_token: update_file_with_new_tokens(file_path, acc_token, acc_token, ref_token, ref_token)
+                if not uid: continue
+                
+                # بررسی آدرس اکانت
+                status, addr_res = await api_get_address(acc_token, uid)
+                if status == 200 and isinstance(addr_res, dict) and addr_res.get('data') and len(addr_res['data']) > 0:
+                    template_file = filename
+                    template_addr = addr_res['data'][0]
+                    
+                    # حالا که آدرس دارد، بررسی می‌کنیم سبد خرید هم دارد یا نه
+                    status, stores_res = await api_get_stores(acc_token, template_addr['lat'], template_addr['lng'], uid)
+                    if status == 200 and isinstance(stores_res, dict) and stores_res.get('data', {}).get('stores'):
+                        store_ids = [s['storeId'] for s in stores_res['data']['stores']]
+                        status, cart_res = await api_get_cart(acc_token, uid, store_ids)
+                        if status == 200 and isinstance(cart_res, dict) and cart_res.get('data', {}).get('result'):
+                            c_data = cart_res['data']['result'][0]
+                            cart_items = c_data.get('items', [])
+                            cart_store_id = c_data.get('storeId')
+                    
+                    break # الگو پیدا شد، توقف جستجو
+                    
+            if not template_file:
+                await msg.edit_text("❌ جستجوی هوشمند شکست خورد: هیچ‌کدام از اکانت‌های داخل فایل زیپ، دارای آدرس ثبت‌شده نبودند!")
                 return
-
-            # ۱. گرفتن آدرس اکانت الگو
-            status, addr_res = await api_get_address(t_acc, t_uid)
-            if status != 200 or not isinstance(addr_res, dict) or not addr_res.get('data') or len(addr_res.get('data', [])) == 0:
-                error_msg = (
-                    f"❌ **خطا در دریافت آدرس اکانت الگو ({template_file})**\n\n"
-                    f"وضعیت (Status): `{status}`\n"
-                    f"آیدی کاربر: `{t_uid}`\n"
-                    f"پاسخ سرور: \n`{str(addr_res)[:300]}`"
-                )
-                await msg.edit_text(error_msg, parse_mode='Markdown')
-                return
-            template_addr = addr_res['data'][0]
-
-            # ۲. گرفتن فروشگاه‌ها
-            status, stores_res = await api_get_stores(t_acc, template_addr['lat'], template_addr['lng'], t_uid)
-            if status != 200 or not isinstance(stores_res, dict) or not stores_res.get('data', {}).get('stores'):
-                error_msg = (
-                    f"❌ **خطا در دریافت لیست فروشگاه‌ها**\n\n"
-                    f"وضعیت (Status): `{status}`\n"
-                    f"پاسخ سرور: \n`{str(stores_res)[:300]}`"
-                )
-                await msg.edit_text(error_msg, parse_mode='Markdown')
-                return
-            store_ids = [s['storeId'] for s in stores_res['data']['stores']]
-
-            # ۳. گرفتن سبد خرید
-            status, cart_res = await api_get_cart(t_acc, t_uid, store_ids)
-            if status != 200 or not isinstance(cart_res, dict) or not cart_res.get('data', {}).get('result'):
-                error_msg = (
-                    f"❌ **خطا در دریافت سبد خرید الگو**\n\n"
-                    f"وضعیت (Status): `{status}`\n"
-                    f"پاسخ سرور: \n`{str(cart_res)[:300]}`"
-                )
-                await msg.edit_text(error_msg, parse_mode='Markdown')
-                return
-
-            cart_data = cart_res['data']['result'][0]
-            cart_items = cart_data.get('items', [])
-            cart_store_id = cart_data.get('storeId')
-
+                
             if not cart_items:
-                await msg.edit_text("❌ سبد خرید اکانت الگو در سرور خالی است! لطفاً ابتدا اجناس را اضافه کنید.")
+                await msg.edit_text(f"⚠️ اکانت الگو پیدا شد ({template_file}) اما سبد خرید آن خالی است. لطفاً ابتدا به آن کالا اضافه کنید.")
                 return
 
-            await msg.edit_text(f"🎯 اطلاعات الگو با موفقیت دریافت شد. در حال اعمال روی {len(target_files)} اکانت دیگر در سرور اکالا...")
+            # جدا کردن اکانت‌های هدف (بقیه فایل‌ها غیر از الگو)
+            target_files = [f for f in json_files if f != template_file]
+            
+            await msg.edit_text(f"🎯 الگوی معتبر یافت شد: `{template_file}`\nدر حال اعمال آدرس و سبد خرید روی {len(target_files)} اکانت دیگر...")
 
             links_text = f"🛒 **گزارش کپی سبد و آدرس (الگو: {template_file}):**\n\n"
             count = 0
@@ -745,7 +733,7 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    logging.info("🚀 Server is live with Enhanced Error Logging...")
+    logging.info("🚀 Server is live with Smart Template Detection...")
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
