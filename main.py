@@ -550,19 +550,25 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link_keys = await redis_client.keys("acc_link:*")
         maint = await redis_client.get("settings:maintenance")
         exp = await redis_client.get("settings:expire_time")
-        exp = int(exp) // 3600 if exp else 2
+        exp = int(exp) if exp else 7200
+        exp_str = f"{exp // 86400} روز" if exp >= 86400 else f"{exp // 3600} ساعت"
         status = "غیرفعال" if maint == "1" else "فعال"
-        text = f"وضعیت سیستم:\n\nتعداد کل اکانت‌ها: {len(acc_keys)}\nلینک‌های فعال: {len(link_keys)}\nزمان انقضا: {exp} ساعت\nوضعیت ربات: {status}"
+        text = f"وضعیت سیستم:\n\nتعداد کل اکانت‌ها: {len(acc_keys)}\nلینک‌های فعال: {len(link_keys)}\nزمان انقضا: {exp_str}\nوضعیت ربات: {status}"
         await query.edit_message_text(text, reply_markup=get_admin_keyboard())
         
     elif data == "admin_expire":
-        kb = [[InlineKeyboardButton("۱ ساعت", callback_data="set_exp_3600"), InlineKeyboardButton("۲ ساعت", callback_data="set_exp_7200")], [InlineKeyboardButton("۱۲ ساعت", callback_data="set_exp_43200"), InlineKeyboardButton("۲۴ ساعت", callback_data="set_exp_86400")], [InlineKeyboardButton("بازگشت", callback_data="admin_panel")]]
+        kb = [
+            [InlineKeyboardButton("۱ ساعت", callback_data="set_exp_3600"), InlineKeyboardButton("۲۴ ساعت", callback_data="set_exp_86400")],
+            [InlineKeyboardButton("۱ هفته", callback_data="set_exp_604800"), InlineKeyboardButton("۱ ماه", callback_data="set_exp_2592000")],
+            [InlineKeyboardButton("بازگشت", callback_data="admin_panel")]
+        ]
         await query.edit_message_text("زمان انقضای لینک‌ها را تعیین کنید:", reply_markup=InlineKeyboardMarkup(kb))
         
     elif data.startswith("set_exp_"):
         new_time = int(data.split("_")[2])
         await redis_client.set("settings:expire_time", new_time)
-        await query.edit_message_text(f"انقضای لینک‌ها با موفقیت به {new_time // 3600} ساعت تغییر یافت.", reply_markup=get_admin_keyboard())
+        exp_str = f"{new_time // 86400} روز" if new_time >= 86400 else f"{new_time // 3600} ساعت"
+        await query.edit_message_text(f"انقضای لینک‌ها با موفقیت به {exp_str} تغییر یافت.", reply_markup=get_admin_keyboard())
 
     elif data == "admin_check_discounts":
         acc_keys = await redis_client.keys("account:*")
@@ -701,7 +707,8 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     expire_time = int(expire_time) if expire_time else 7200
     await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
     final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-    await status_msg.edit_text(f"ورود با موفقیت انجام شد.\n\n{final_url}\n\n(لینک دریافتی تا {expire_time // 3600} ساعت آینده معتبر خواهد بود)", disable_web_page_preview=True)
+    exp_str = f"{expire_time // 86400} روز" if expire_time >= 86400 else f"{expire_time // 3600} ساعت"
+    await status_msg.edit_text(f"ورود با موفقیت انجام شد.\n\n{final_url}\n\n(لینک دریافتی تا {exp_str} آینده معتبر خواهد بود)", disable_web_page_preview=True)
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
