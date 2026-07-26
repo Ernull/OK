@@ -34,7 +34,7 @@ BASE_HEADERS = {
 }
 
 # ==========================================
-# توابع پس‌زمینه (تخفیف‌ها)
+# توابع مربوط به تخفیف و آیدی
 # ==========================================
 def get_user_id_from_token(token):
     try:
@@ -47,46 +47,34 @@ def get_user_id_from_token(token):
         return None
 
 async def process_discounts_and_send_report(bot, acc_keys):
-    report_text = "🎁 **گزارش کدهای تخفیف:**\n\n"
+    report_text = "🎁 **گزارش کدهای تخفیف دیتابیس:**\n\n"
     found_any = False
     
     for key in acc_keys:
         phone = key.replace("account:", "")
         token_data = await redis_client.hgetall(key)
         access_token = token_data.get("access_token")
-        
         if not access_token: continue
         
         user_uuid = get_user_id_from_token(access_token)
         if not user_uuid: continue
             
-        headers = {
-            'Authorization': f'Bearer {access_token}',
-            'Accept': 'application/json, text/plain, */*',
-            'source': 'okala',
-            'ui-version': '2.0',
-            'origin': 'https://www.okala.com',
-            'User-Agent': BASE_HEADERS["User-Agent"]
-        }
-        
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json', 'source': 'okala', 'ui-version': '2.0', 'User-Agent': BASE_HEADERS["User-Agent"]}
         url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
         
         try:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, timeout=10))
-            
             if response.status_code == 200:
                 data = response.json()
                 vouchers = data.get('data', [])
-                
                 if vouchers:
                     found_any = True
-                    report_text += f"📱 `{phone}`: دارای {len(vouchers)} تخفیف فعال\n"
+                    report_text += f"📱 `{phone}`: دارای {len(vouchers)} تخفیف\n"
         except Exception as e:
             logging.error(f"Error checking discount for {phone}: {e}")
             
-    if not found_any:
-        report_text += "هیچ تخفیف فعالی در اکانت‌ها یافت نشد."
+    if not found_any: report_text += "هیچ تخفیفی یافت نشد."
         
     if len(report_text) > 4000:
         file_out = io.BytesIO(report_text.encode('utf-8'))
@@ -139,7 +127,7 @@ def format_for_injector(auth_data):
     }
 
 # ==========================================
-# پردازش فایل زیپ و تبدیل به لینک (جدید)
+# پردازش فایل زیپ اختصاصی ادمین
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -149,83 +137,171 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لطفاً فقط فایل زیپ (.zip) ارسال کنید.")
         return
         
+    action = context.user_data.get('admin_zip_action', 'zip_to_link')
+    
     msg = await update.message.reply_text("⏳ در حال دانلود و استخراج فایل زیپ...")
     
     expire_time = await redis_client.get("settings:expire_time")
     expire_time = int(expire_time) if expire_time else 7200
     
     new_file = await update.message.document.get_file()
-    links_text = "🔗 **لیست لینک‌های تولید شده:**\n\n"
-    count = 0
     
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_path = os.path.join(temp_dir, "uploaded.zip")
         await new_file.download_to_drive(zip_path)
         
         extracted_dir = os.path.join(temp_dir, "extracted")
-        # جلوگیری از قفل شدن ربات هنگام اکسترکت
         await asyncio.to_thread(shutil.unpack_archive, zip_path, extracted_dir)
         
-        src_accounts = None
+        src_accounts, src_data = None, None
         for root, dirs, files in os.walk(extracted_dir):
-            if 'accounts' in dirs and not src_accounts:
-                src_accounts = os.path.join(root, 'accounts')
-                break
+            if 'accounts' in dirs and not src_accounts: src_accounts = os.path.join(root, 'accounts')
+            if 'data' in dirs and not src_data: src_data = os.path.join(root, 'data')
                 
         if not src_accounts:
             await msg.edit_text("❌ پوشه 'accounts' داخل فایل زیپ پیدا نشد.")
             return
+
+        # ===================================================
+        # حالت اول: فقط تولید لینک و ذخیره در دیتابیس
+        # ===================================================
+        if action == 'zip_to_link':
+            links_text = "🔗 **لیست لینک‌های تولید شده:**\n\n"
+            count = 0
             
-        for filename in os.listdir(src_accounts):
-            if not filename.endswith('.json'): continue
-            
-            file_path = os.path.join(src_accounts, filename)
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    file_content = f.read()
-                    data = json.loads(file_content)
-                    
-                    # ذخیره هوشمند در دیتابیس برای سیستم تخفیف‌ها
-                    access_token, refresh_token = None, None
-                    for cookie in data.get('cookies', []):
-                        if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                        elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-                    
-                    if not access_token:
-                        for origin in data.get('origins', []):
-                            for item in origin.get('localStorage', []):
-                                if item.get('name') == 'tokenMS': access_token = item.get('value')
-                                elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
-                    
-                    phone = filename.replace('.json', '')
-                    if access_token:
-                        await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
-                    
-                    # ساخت لینک
-                    link_id = str(uuid.uuid4())[:12]
-                    await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
-                    
-                    final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                    links_text += f"📱 {phone}:\n{final_url}\n\n"
-                    count += 1
-                    
-            except Exception as e:
-                logging.error(f"Error processing {filename}: {e}")
+            for filename in os.listdir(src_accounts):
+                if not filename.endswith('.json'): continue
                 
-    if count == 0:
-        await msg.edit_text("⚠️ هیچ اکانت معتبری (فایل JSON) در پوشه accounts یافت نشد.")
-        return
-        
-    if len(links_text) > 4000:
-        file_out = io.BytesIO(links_text.encode('utf-8'))
-        file_out.name = f"Generated_Links_{int(time.time())}.txt"
-        await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ {count} اکانت استخراج، در دیتابیس ذخیره و لینک‌های آنها تولید شد.")
-        await msg.delete()
-    else:
-        await msg.edit_text(f"✅ {count} اکانت با موفقیت ذخیره و تبدیل شد:\n\n{links_text}", disable_web_page_preview=True)
+                file_path = os.path.join(src_accounts, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        data = json.loads(file_content)
+                        
+                        access_token, refresh_token = None, None
+                        for cookie in data.get('cookies', []):
+                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                            elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+                        
+                        if not access_token:
+                            for origin in data.get('origins', []):
+                                for item in origin.get('localStorage', []):
+                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
+                                    elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
+                        
+                        phone = filename.replace('.json', '')
+                        if access_token:
+                            # ⚠️ جلوگیری از ذخیره تکراری (عدم بازنویسی اکانت‌های موجود)
+                            if not await redis_client.exists(f"account:{phone}"):
+                                await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                        
+                        link_id = str(uuid.uuid4())[:12]
+                        await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
+                        
+                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                        links_text += f"📱 {phone}:\n{final_url}\n\n"
+                        count += 1
+                except Exception as e:
+                    logging.error(f"Error processing {filename}: {e}")
+                    
+            if count == 0:
+                await msg.edit_text("⚠️ هیچ اکانت معتبری یافت نشد.")
+                return
+                
+            if len(links_text) > 4000:
+                file_out = io.BytesIO(links_text.encode('utf-8'))
+                file_out.name = f"Generated_Links_{int(time.time())}.txt"
+                await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"✅ {count} اکانت استخراج شد.")
+                await msg.delete()
+            else:
+                await msg.edit_text(f"✅ {count} اکانت با موفقیت ذخیره شد:\n\n{links_text}", disable_web_page_preview=True)
+
+        # ===================================================
+        # حالت دوم: فیلتر تخفیف‌ها + خروجی زیپ + تولید لینک
+        # ===================================================
+        elif action == 'zip_discount_check':
+            await msg.edit_text("🔍 در حال بررسی تخفیف‌های فایل زیپ... لطفاً صبور باشید.")
+            
+            discount_dir = os.path.join(temp_dir, "Discount_Accounts")
+            os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
+            if src_data and os.path.exists(os.path.join(src_data, 'accounts.json')):
+                os.makedirs(os.path.join(discount_dir, 'data'), exist_ok=True)
+                shutil.copy2(os.path.join(src_data, 'accounts.json'), os.path.join(discount_dir, 'data'))
+                
+            links_text = "🎁 **لیست لینک‌های دارای تخفیف:**\n\n"
+            discount_count = 0
+            
+            for filename in os.listdir(src_accounts):
+                if not filename.endswith('.json'): continue
+                
+                file_path = os.path.join(src_accounts, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        data = json.loads(file_content)
+                        
+                        access_token = None
+                        for cookie in data.get('cookies', []):
+                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                        if not access_token:
+                            for origin in data.get('origins', []):
+                                for item in origin.get('localStorage', []):
+                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
+                        
+                        if access_token:
+                            user_uuid = get_user_id_from_token(access_token)
+                            if user_uuid:
+                                headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json', 'source': 'okala', 'ui-version': '2.0', 'User-Agent': BASE_HEADERS["User-Agent"]}
+                                url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
+                                
+                                loop = asyncio.get_running_loop()
+                                response = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, timeout=10))
+                                
+                                if response.status_code == 200 and response.json().get('data'):
+                                    discount_count += 1
+                                    
+                                    # کپی فایل به پوشه خروجی تخفیف‌دارها
+                                    shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
+                                    
+                                    # ساخت لینک
+                                    link_id = str(uuid.uuid4())[:12]
+                                    await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
+                                    phone = filename.replace('.json', '')
+                                    links_text += f"📱 {phone}:\n{WEB_DOMAIN}/acc/{link_id}\n\n"
+                                    
+                                    # ⚠️ جلوگیری از ذخیره شماره تکراری
+                                    if not await redis_client.exists(f"account:{phone}"):
+                                        # استخراج رفرش توکن برای دیتابیس
+                                        refresh_token = ""
+                                        for cookie in data.get('cookies', []):
+                                            if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+                                        await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token})
+                except Exception as e:
+                    logging.error(f"Error processing {filename} in zip check: {e}")
+                    
+            if discount_count > 0:
+                # زیپ کردن پوشه تخفیف‌دارها
+                discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
+                await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
+                
+                await msg.delete()
+                
+                # ارسال فایل زیپ به ادمین
+                with open(discount_zip_path + '.zip', 'rb') as zip_file:
+                    await context.bot.send_document(chat_id=ADMIN_ID, document=zip_file, caption=f"🎉 فایل زیپ فیلتر شده\nتعداد: {discount_count} اکانت تخفیف‌دار")
+                
+                # ارسال لینک‌ها
+                if len(links_text) > 4000:
+                    file_out = io.BytesIO(links_text.encode('utf-8'))
+                    file_out.name = f"Discount_Links_{int(time.time())}.txt"
+                    await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption="🔗 فایل متنی حاوی لینک‌های تخفیف‌دار")
+                else:
+                    await context.bot.send_message(chat_id=ADMIN_ID, text=links_text, disable_web_page_preview=True)
+            else:
+                await msg.edit_text("⚠️ متأسفانه هیچکدام از اکانت‌های داخل فایل زیپ، کد تخفیف نداشتند!")
 
 # ==========================================
-# بخش مینی‌سرور وب
+# مینی‌سرور وب
 # ==========================================
 async def web_handler_get_account(request):
     link_id = request.match_info.get('link_id', '')
@@ -244,12 +320,13 @@ async def start_web_server():
     await site.start()
 
 # ==========================================
-# بخش پنل مدیریت (Admin Panel)
+# پنل مدیریت
 # ==========================================
 def get_admin_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("⏱ تنظیم انقضا", callback_data="admin_expire")],
-        [InlineKeyboardButton("🎁 بررسی تخفیف‌ها", callback_data="admin_check_discounts"), InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link")],
+        [InlineKeyboardButton("🎁 بررسی تخفیف‌های دیتابیس", callback_data="admin_check_discounts")],
+        [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("📦 بررسی تخفیف فایل زیپ", callback_data="admin_zip_discount")],
         [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی", callback_data="admin_clear")],
         [InlineKeyboardButton("🔌 روشن/خاموش کردن ربات", callback_data="admin_toggle")]
     ]
@@ -257,6 +334,8 @@ def get_admin_keyboard():
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
+    # ریست کردن حالت زیپ هنگام باز کردن مجدد پنل
+    context.user_data['admin_zip_action'] = None
     await update.message.reply_text("👑 **به پنل مدیریت خوش آمدید:**", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,16 +352,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp = await redis_client.get("settings:expire_time")
         exp = int(exp) // 3600 if exp else 2
         status = "🔴 خاموش" if maint == "1" else "🟢 روشن"
-        
         text = f"📊 **آمار سیستم:**\n\n👥 کل اکانت‌ها: `{len(acc_keys)}`\n🔗 لینک‌های فعال: `{len(link_keys)}`\n⏱ انقضای لینک‌ها: `{exp} ساعت`\nوضعیت ربات: {status}"
         await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode='Markdown')
         
     elif data == "admin_expire":
-        kb = [
-            [InlineKeyboardButton("۱ ساعت", callback_data="set_exp_3600"), InlineKeyboardButton("۲ ساعت", callback_data="set_exp_7200")],
-            [InlineKeyboardButton("۱۲ ساعت", callback_data="set_exp_43200"), InlineKeyboardButton("۲۴ ساعت", callback_data="set_exp_86400")],
-            [InlineKeyboardButton("بازگشت 🔙", callback_data="admin_back")]
-        ]
+        kb = [[InlineKeyboardButton("۱ ساعت", callback_data="set_exp_3600"), InlineKeyboardButton("۲ ساعت", callback_data="set_exp_7200")], [InlineKeyboardButton("۱۲ ساعت", callback_data="set_exp_43200"), InlineKeyboardButton("۲۴ ساعت", callback_data="set_exp_86400")], [InlineKeyboardButton("بازگشت 🔙", callback_data="admin_back")]]
         await query.edit_message_text("⏱ **زمان انقضای لینک‌ها را انتخاب کنید:**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         
     elif data.startswith("set_exp_"):
@@ -295,23 +369,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc_keys:
             await query.message.reply_text("دیتابیس خالی است!")
             return
-            
-        await query.message.reply_text(f"🔍 در حال بررسی تخفیف‌های {len(acc_keys)} اکانت...\nاین عملیات در پس‌زمینه انجام می‌شود.")
+        await query.message.reply_text(f"🔍 در حال بررسی تخفیف‌های {len(acc_keys)} اکانت (دیتابیس)...")
         asyncio.create_task(process_discounts_and_send_report(context.bot, acc_keys))
         
     elif data == "admin_zip_to_link":
-        await query.message.reply_text("📥 **تبدیل زیپ به لینک:**\n\nلطفاً یک فایل `.zip` (که حاوی پوشه accounts و فایل‌های JSON است) را در همین صفحه ارسال کنید تا ربات آنها را تبدیل کند.", parse_mode='Markdown')
+        context.user_data['admin_zip_action'] = 'zip_to_link'
+        await query.message.reply_text("📥 **تبدیل ساده زیپ به لینک:**\n\nفایل زیپ را بفرستید تا لینک‌ها تولید شوند (بدون بررسی تخفیف).", parse_mode='Markdown')
+        
+    elif data == "admin_zip_discount":
+        context.user_data['admin_zip_action'] = 'zip_discount_check'
+        await query.message.reply_text("📦 **بررسی تخفیف فایل زیپ:**\n\nفایل زیپ را بفرستید تا تخفیف‌ها بررسی شوند و اکانت‌های دارای تخفیف در قالب **یک فایل زیپ جدید + لینک‌های ورود** برای شما ارسال شوند.", parse_mode='Markdown')
 
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
         if not acc_keys:
             await query.message.reply_text("دیتابیس خالی است!")
             return
-        
         export_text = "لیست شماره‌های ثبت شده در ربات:\n\n"
-        for key in acc_keys:
-            export_text += f"{key.replace('account:', '')}\n"
-            
+        for key in acc_keys: export_text += f"{key.replace('account:', '')}\n"
         file_out = io.BytesIO(export_text.encode('utf-8'))
         file_out.name = f"Okala_Accounts_{int(time.time())}.txt"
         await context.bot.send_document(chat_id=ADMIN_ID, document=file_out, caption=f"📥 فایل حاوی {len(acc_keys)} اکانت")
@@ -333,10 +408,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"وضعیت ربات تغییر یافت:\nوضعیت فعلی: **{status}**", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
         
     elif data == "admin_back":
+        context.user_data['admin_zip_action'] = None
         await query.edit_message_text("👑 **به پنل مدیریت خوش آمدید:**", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
 
 # ==========================================
-# بخش ربات تلگرام (مراحل لاگین)
+# ربات تلگرام (مراحل لاگین)
 # ==========================================
 async def async_request(method, url, **kwargs):
     loop = asyncio.get_running_loop()
@@ -396,6 +472,7 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
         auth_data = response.json()
         context.user_data['auth_data'] = auth_data 
         
+        # ⚠️ هنگام لاگین مجدد با OTP، توکن جدید حتماً بازنویسی می‌شود
         if auth_data.get("access_token"):
             await redis_client.hset(f"account:{phone}", mapping={"access_token": auth_data.get("access_token"), "refresh_token": auth_data.get("refresh_token")})
 
@@ -435,14 +512,7 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
     
     final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-    
-    success_text = (
-        "✅ <b>لاگین با موفقیت انجام شد!</b>\n\n"
-        f"<code>{final_url}</code>\n\n"
-        f"<i>(🔒 لینک تا {expire_time // 3600} ساعت آینده معتبر است)</i>"
-    )
-    
-    await status_msg.edit_text(success_text, parse_mode='HTML')
+    await status_msg.edit_text(f"✅ <b>لاگین با موفقیت انجام شد!</b>\n\n<code>{final_url}</code>\n\n<i>(🔒 لینک تا {expire_time // 3600} ساعت آینده معتبر است)</i>", parse_mode='HTML')
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -450,7 +520,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 # ==========================================
-# بخش راه‌اندازی اصلی
+# راه‌اندازی اصلی
 # ==========================================
 async def main():
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -458,14 +528,10 @@ async def main():
 
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # هندلرهای ادمین
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_|^set_exp_"))
-    
-    # هندلر دریافت فایل زیپ
     application.add_handler(MessageHandler(filters.Document.FileExtension("zip"), handle_zip_upload))
 
-    # هندلرهای لاگین
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -481,7 +547,7 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    logging.info("🚀 System is running with Admin Panel & Zip Extractor...")
+    logging.info("🚀 System is fully operational...")
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
