@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -83,36 +82,48 @@ def get_user_id_from_token(token):
         return 0
 
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
-    report_text = "گزارش کدهای تخفیف (دیتابیس):\n\n"
+    report_text = "🎁 <b>گزارش کدهای تخفیف (دیتابیس):</b>\n\n"
     found_any = False
+    
     for key in acc_keys:
-        phone = key.replace("account:", "")
-        token_data = await redis_client.hgetall(key)
-        access_token = token_data.get("access_token")
-        if not access_token: continue
-        user_uuid = get_user_id_from_token(access_token)
-        if not user_uuid: continue
-        headers = BASE_HEADERS.copy()
-        headers['Authorization'] = f'Bearer {access_token}'
-        url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
         try:
+            phone = key.replace("account:", "")
+            token_data = await redis_client.hgetall(key)
+            access_token = token_data.get("access_token")
+            if not access_token: continue
+            
+            user_uuid = get_user_id_from_token(access_token)
+            if not user_uuid: continue
+            
+            headers = BASE_HEADERS.copy()
+            headers['Authorization'] = f'Bearer {access_token}'
+            url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
+            
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, timeout=10))
+            
             if response.status_code == 200:
                 data = response.json()
                 vouchers = data.get('data', [])
                 if vouchers:
                     found_any = True
-                    report_text += f"شماره {phone}: دارای {len(vouchers)} تخفیف\n"
-        except Exception:
+                    report_text += f"📱 شماره {phone}: دارای <b>{len(vouchers)}</b> تخفیف\n"
+        except Exception as e:
+            logging.error(f"Discount check error for {key}: {e}")
             pass
+            
     if not found_any: report_text += "هیچ تخفیفی یافت نشد."
-    if len(report_text) > 4000:
-        file_out = io.BytesIO(report_text.encode('utf-8'))
-        file_out.name = f"Discounts_Report_{int(time.time())}.txt"
-        await bot.send_document(chat_id=chat_id, document=file_out, caption="گزارش کامل تخفیف‌ها")
-    else:
-        await bot.send_message(chat_id=chat_id, text=report_text)
+    
+    try:
+        if len(report_text) > 4000:
+            file_out = io.BytesIO(report_text.encode('utf-8'))
+            # مشکل عدم ارسال فایل حل شد: اضافه شدن پارامتر filename
+            await bot.send_document(chat_id=chat_id, document=file_out, filename=f"Discounts_Report_{int(time.time())}.txt", caption="✅ گزارش کامل تخفیف‌ها")
+        else:
+            await bot.send_message(chat_id=chat_id, text=report_text, parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Error sending report doc: {e}")
+        await bot.send_message(chat_id=chat_id, text="❌ خطا در ارسال فایل گزارش.")
 
 # ==========================================
 # تبدیل دیتا برای وب
@@ -228,8 +239,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
             if len(links_text) > 4000:
                 file_out = io.BytesIO(links_text.encode('utf-8'))
-                file_out.name = f"Links_{int(time.time())}.txt"
-                await context.bot.send_document(chat_id=user_id, document=file_out, caption=f"✅ استخراج {count} اکانت انجام شد.")
+                await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Links_{int(time.time())}.txt", caption=f"✅ استخراج {count} اکانت انجام شد.")
                 await msg.delete()
             else:
                 await msg.edit_text(f"✅ <b>تعداد {count} اکانت ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
@@ -275,11 +285,10 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
                 await msg.delete()
                 with open(discount_zip_path + '.zip', 'rb') as zip_file:
-                    await context.bot.send_document(chat_id=user_id, document=zip_file, caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
+                    await context.bot.send_document(chat_id=user_id, document=zip_file, filename="Discounted_Accounts.zip", caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
                 if len(links_text) > 4000:
                     file_out = io.BytesIO(links_text.encode('utf-8'))
-                    file_out.name = f"Discount_Links_{int(time.time())}.txt"
-                    await context.bot.send_document(chat_id=user_id, document=file_out, caption="🔗 لینک‌های دسترسی سریع")
+                    await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Discount_Links_{int(time.time())}.txt", caption="🔗 لینک‌های دسترسی سریع")
                 else:
                     await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
             else:
@@ -319,6 +328,7 @@ def get_admin_keyboard():
         [InlineKeyboardButton("🎁 بررسی تخفیف دیتابیس", callback_data="admin_check_discounts")],
         [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("🔍 بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
         [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی دیتابیس", callback_data="admin_clear")],
+        [InlineKeyboardButton("🔗 استخراج لینک‌ها با شماره", callback_data="admin_export_links")], # <--- دکمه جدید
         [InlineKeyboardButton("⏸ روشن/خاموش کردن", callback_data="admin_toggle")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ]
@@ -386,7 +396,86 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp_str = f"{new_time // 86400} روز" if new_time >= 86400 else f"{new_time // 3600} ساعت"
         await query.edit_message_text(f"✅ انقضای لینک‌ها با موفقیت به <b>{exp_str}</b> تغییر یافت.", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
-    # ... (سایر هندلرهای پنل مدیریت مانند قبل)
+    elif data == "admin_check_discounts":
+        acc_keys = await redis_client.keys("account:*")
+        if not acc_keys:
+            # بجای query.message.reply استفاده شد تا تحت هر شرایطی پیام ارسال شود
+            await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
+            return
+        await context.bot.send_message(chat_id=user_id, text="⏳ در حال پردازش اطلاعات دیتابیس. لطفاً منتظر بمانید...")
+        asyncio.create_task(process_discounts_and_send_report(context.bot, user_id, acc_keys))
+        
+    elif data == "admin_zip_to_link":
+        context.user_data['admin_zip_action'] = 'zip_to_link'
+        await context.bot.send_message(chat_id=user_id, text="🔗 <b>عملیات استخراج لینک:</b>\nلطفاً فایل ZIP مربوطه را ارسال کنید.", parse_mode='HTML')
+        
+    elif data == "admin_zip_discount":
+        context.user_data['admin_zip_action'] = 'zip_discount_check'
+        await context.bot.send_message(chat_id=user_id, text="🔍 <b>عملیات بررسی تخفیف:</b>\nلطفاً فایل ZIP مربوطه را ارسال کنید.", parse_mode='HTML')
+
+    # ==========================
+    # اصلاح استخراج شماره ها
+    # ==========================
+    elif data == "admin_export":
+        acc_keys = await redis_client.keys("account:*")
+        if not acc_keys:
+            await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
+            return
+        export_text = "لیست شماره‌های ثبت شده در سیستم:\n\n"
+        for key in acc_keys: export_text += f"{key.replace('account:', '')}\n"
+        
+        file_out = io.BytesIO(export_text.encode('utf-8'))
+        try:
+            # اضافه شدن filename الزامی برای رفع باگ ارسال فایل
+            await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Accounts_{int(time.time())}.txt", caption="📥 فایل دیتابیس (شماره‌ها) دریافت شد.")
+        except Exception as e:
+            logging.error(f"Error sending export: {e}")
+            await context.bot.send_message(chat_id=user_id, text="❌ خطا در ارسال فایل استخراج.")
+
+    # ==========================
+    # قابلیت جدید استخراج لینک ها با شماره
+    # ==========================
+    elif data == "admin_export_links":
+        link_keys = await redis_client.keys("acc_link:*")
+        if not link_keys:
+            await context.bot.send_message(chat_id=user_id, text="⚠️ هیچ لینکی در دیتابیس موجود نیست.")
+            return
+            
+        await context.bot.send_message(chat_id=user_id, text="⏳ در حال استخراج لینک‌ها و شماره‌ها. لطفاً منتظر بمانید...")
+        
+        export_text = "لیست لینک‌های فعال به همراه شماره:\n\n"
+        count = 0
+        
+        for l_key in link_keys:
+            link_id = l_key.replace("acc_link:", "")
+            final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+            link_data = await redis_client.get(l_key)
+            phone = "نامشخص"
+            
+            try:
+                # رمزگشایی و استخراج شماره تلفن از دیتای ذخیره شده
+                data_json = json.loads(link_data)
+                origins = data_json.get("origins", [])
+                if origins:
+                    for item in origins[0].get("localStorage", []):
+                        if item.get("name") == "user":
+                            user_obj = json.loads(urllib.parse.unquote(item.get("value")))
+                            phone = user_obj.get("mobilePhone", "نامشخص")
+                            break
+            except Exception:
+                pass
+                
+            export_text += f"📱 شماره: {phone}\n🔗 لینک: {final_url}\n\n"
+            count += 1
+            
+        file_out = io.BytesIO(export_text.encode('utf-8'))
+        try:
+            # اضافه شدن filename الزامی برای رفع باگ ارسال فایل
+            await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Links_With_Phone_{int(time.time())}.txt", caption=f"✅ استخراج {count} لینک با موفقیت انجام شد.")
+        except Exception as e:
+            logging.error(f"Error sending links doc: {e}")
+            await context.bot.send_message(chat_id=user_id, text="❌ خطا در ارسال فایل لینک‌ها.")
+
     elif data == "admin_clear":
         kb = [[InlineKeyboardButton("✅ تایید عملیات حذف", callback_data="admin_clear_confirm"), InlineKeyboardButton("❌ انصراف", callback_data="admin_panel")]]
         await query.edit_message_text("⚠️ <b>اخطار:</b> این عملیات تمامی اطلاعات ثبت شده را حذف خواهد کرد.\nآیا تایید می‌کنید؟", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
@@ -404,7 +493,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⚙️ <b>تغییر وضعیت سیستم:</b>\nوضعیت کنونی: {status}", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
 # ==========================================
-# توابع لاگین کاربر (اصلاح شده با دکمه‌ها و پایداری)
+# توابع لاگین کاربر 
 # ==========================================
 async def async_request(method, url, **kwargs):
     loop = asyncio.get_running_loop()
@@ -431,31 +520,26 @@ async def check_maintenance(update: Update) -> bool:
         return True
     return False
 
-# تابع کمکی برای درخواست کد از API
 async def do_send_otp_request(phone, context):
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/OTPRegister"
     payload = {"mobile": phone, "deviceTypeCode": 7, "confirmTerms": True, "notRobot": False, "otpType": 0, "ValidationCodeCreateReason": 5, "OtpApp": 0, "IsAppOnly": False}
     return await async_request('POST', url, json=payload, headers=get_user_headers(context), timeout=15)
 
-# --- استارت پروسه لاگین ---
 async def start_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
     await update.callback_query.answer()
     
-    # اضافه شدن دکمه کنسل
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_login")]])
     await update.callback_query.edit_message_text("📱 <b>لطفاً شماره موبایل خود را وارد کنید:</b>", reply_markup=kb, parse_mode='HTML')
     return PHONE
 
-# --- لغو عملیات در حین انجام ---
 async def cancel_login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer("عملیات لغو شد ❌")
     context.user_data.clear()
-    await show_main_menu(update, context) # برگشت به منوی اصلی
+    await show_main_menu(update, context) 
     return ConversationHandler.END
 
-# --- دریافت شماره و ارسال کد ---
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
     phone = update.message.text.strip()
@@ -464,7 +548,6 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     response = await do_send_otp_request(phone, context)
     
     if response.status_code == 200:
-        # اضافه شدن دکمه‌های ارسال مجدد و کنسل
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
             [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_login")]
@@ -475,7 +558,6 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text(f"❌ خطا در ارتباط با سیستم: <code>{response.status_code}</code>", parse_mode='HTML')
         return ConversationHandler.END
 
-# --- درخواست مجدد کد از طریق دکمه شیشه‌ای ---
 async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     phone = context.user_data.get('phone')
@@ -492,9 +574,8 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text(f"✉️ <b>کد تایید مجدداً به {phone} ارسال شد.</b>\nلطفاً کد جدید را وارد کنید:", reply_markup=kb, parse_mode='HTML')
     else:
         await query.edit_message_text(f"❌ خطا در ارسال مجدد: <code>{response.status_code}</code>\nلطفاً دوباره تلاش کنید.", reply_markup=kb, parse_mode='HTML')
-    return OTP # در حالت OTP باقی میماند
+    return OTP 
 
-# --- بررسی کد و نام ---
 async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     otp_code = update.message.text.strip()
     phone = context.user_data.get('phone')
@@ -520,7 +601,6 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
         else:
             return await generate_and_send_link(update, context, msg)
     else:
-        # اینجا مشکل عکس رفع شد! اگر کد اشتباه بود، خارج نمیشود و همانجا با دکمه‌ها منتظر کد درست می‌ماند
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 ارسال مجدد کد ورود", callback_data="resend_otp")],
             [InlineKeyboardButton("❌ کنسل عملیات", callback_data="cancel_login")]
@@ -528,7 +608,6 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
         await msg.edit_text("❌ کد وارد شده معتبر نمی‌باشد (یا منقضی شده است).\nلطفاً مجدداً تلاش کنید یا کد جدید درخواست دهید.", reply_markup=kb)
         return OTP 
 
-# --- گرفتن نام در صورت نیاز ---
 async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     full_name = update.message.text.strip()
     if not full_name: return ASK_NAME
@@ -543,7 +622,6 @@ async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_T
     await async_request('POST', url, json=payload, headers=headers)
     return await generate_and_send_link(update, context, msg)
 
-# --- تولید و ارسال لینک نهایی ---
 async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg) -> int:
     auth_data = context.user_data.get('auth_data')
     injection_json = format_for_injector(auth_data)
@@ -556,7 +634,6 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     final_url = f"{WEB_DOMAIN}/acc/{link_id}"
     exp_str = f"{expire_time // 86400} روز" if expire_time >= 86400 else f"{expire_time // 3600} ساعت"
     
-    # دکمه‌های پایانی برای ادامه ساخت لینک برای خط دیگر
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ ساخت لینک برای یک خط دیگر", callback_data="user_login")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
@@ -570,7 +647,6 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     await status_msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True, parse_mode='HTML')
     return ConversationHandler.END
 
-# --- کنسل کردن از طریق متن ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ عملیات متوقف شد.")
     return ConversationHandler.END
@@ -592,7 +668,6 @@ async def main():
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(MessageHandler(filters.Document.FileExtension("zip"), handle_zip_upload))
 
-    # آپدیت شدن هندلر مکالمه برای پشتیبانی از دکمه‌های شیشه‌ای
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_login_process, pattern="^user_login$")],
         states={
@@ -614,6 +689,7 @@ async def main():
     )
     
     application.add_handler(conv_handler)
+    
     # دکمه‌های منوی اصلی و ادمین
     application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$"))
     
