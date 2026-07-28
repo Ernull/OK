@@ -9,6 +9,7 @@ import io
 import base64
 import tempfile
 import shutil
+import random
 import requests
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
@@ -23,52 +24,55 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
 
-# 📌 خواندن لیست آیدی‌های ادمین از متغیر محیطی (جدا شده با کاما)
 ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
 
 PHONE, OTP, ASK_NAME = range(3)
-executor = ThreadPoolExecutor(max_workers=10)
 
-BASE_HEADERS = {
-    'accept': 'application/json, text/plain, */*',
-    'source': 'okala',
-    'ui-version': '2.0',
-    'origin': 'https://www.okala.com',
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
-}
+# محدود کردن Worker ها به عدد پایین‌تر (مثلا 5) تا سرور اکالا به ترافیک همزمان حساس نشود
+executor = ThreadPoolExecutor(max_workers=5)
+
+# لیست User-Agent های واقعی موبایل برای فریب دادن سیستم ضد ربات
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; Pixel 6 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36"
+]
+
+def get_anti_bot_headers():
+    return {
+        'accept': 'application/json, text/plain, */*',
+        'source': 'okala',
+        'ui-version': '2.0',
+        'origin': 'https://www.okala.com',
+        'User-Agent': random.choice(USER_AGENTS),
+        'X-User-Unique-Id': str(uuid.uuid4()), # ساخت آیدی موبایل جدید برای هر درخواست
+        'X-Correlation-Id': str(uuid.uuid4()),
+        'session-id': str(uuid.uuid4())
+    }
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # ==========================================
-# توابع مربوط به توکن و APIهای سیستم
+# سیستم مدیریت پروکسی و API
 # ==========================================
-def get_tokens_from_file(file_path):
-    access_token, refresh_token = None, None
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            for cookie in data.get('cookies', []):
-                if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-            if not access_token or not refresh_token:
-                for origin in data.get('origins', []):
-                    for item in origin.get('localStorage', []):
-                        if item.get('name') == 'tokenMS': access_token = item.get('value')
-                        elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
-    except Exception:
-        pass
-    return access_token, refresh_token
+async def get_random_proxy_from_db():
+    proxies_json = await redis_client.get("settings:proxies")
+    if proxies_json:
+        proxies = json.loads(proxies_json)
+        if proxies and len(proxies) > 0:
+            p = random.choice(proxies)
+            return {"http": p, "https": p}
+    return None
 
-def update_file_with_new_tokens(file_path, old_acc, new_acc, old_ref, new_ref):
+def sync_api_request(url, headers, proxy_dict):
+    # تاخیر تصادفی بین 1.5 تا 3.5 ثانیه برای شبیه‌سازی رفتار انسان
+    time.sleep(random.uniform(1.5, 3.5)) 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        if old_acc and new_acc: content = content.replace(old_acc, new_acc)
-        if old_ref and new_ref: content = content.replace(old_ref, new_ref)
-        with open(file_path, 'w', encoding='utf-8') as f: f.write(content)
-    except Exception:
-        pass
+        return requests.get(url, headers=headers, proxies=proxy_dict, timeout=15)
+    except Exception as e:
+        return None
 
 def get_user_id_from_token(token):
     try:
@@ -81,9 +85,14 @@ def get_user_id_from_token(token):
     except Exception:
         return 0
 
+# ==========================================
+# پردازش تخفیف‌ها با پروکسی
+# ==========================================
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     report_text = "🎁 <b>گزارش کدهای تخفیف (دیتابیس):</b>\n\n"
     found_any = False
+    
+    loop = asyncio.get_running_loop()
     
     for key in acc_keys:
         try:
@@ -95,14 +104,14 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             user_uuid = get_user_id_from_token(access_token)
             if not user_uuid: continue
             
-            headers = BASE_HEADERS.copy()
+            headers = get_anti_bot_headers()
             headers['Authorization'] = f'Bearer {access_token}'
             url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
             
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, timeout=10))
+            proxy_dict = await get_random_proxy_from_db()
+            response = await loop.run_in_executor(executor, sync_api_request, url, headers, proxy_dict)
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 data = response.json()
                 vouchers = data.get('data', [])
                 if vouchers:
@@ -117,7 +126,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     try:
         if len(report_text) > 4000:
             file_out = io.BytesIO(report_text.encode('utf-8'))
-            # مشکل عدم ارسال فایل حل شد: اضافه شدن پارامتر filename
             await bot.send_document(chat_id=chat_id, document=file_out, filename=f"Discounts_Report_{int(time.time())}.txt", caption="✅ گزارش کامل تخفیف‌ها")
         else:
             await bot.send_message(chat_id=chat_id, text=report_text, parse_mode='HTML')
@@ -157,6 +165,11 @@ def format_for_injector(auth_data):
     persist_root_str = json.dumps(persist_root_dict, ensure_ascii=False)
     
     return {
+        "cookies": [
+            {"name": "tokenMS", "value": access_token, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"},
+            {"name": "token", "value": access_token, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"},
+            {"name": "refresh_token", "value": refresh_token, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"}
+        ],
         "origins": [{
             "origin": "https://www.okala.com",
             "localStorage": [
@@ -245,11 +258,13 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"✅ <b>تعداد {count} اکانت ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
 
         elif action == 'zip_discount_check':
-            await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها. لطفاً منتظر بمانید...")
+            await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها با سیستم ضدربات. لطفاً منتظر بمانید...")
             discount_dir = os.path.join(temp_dir, "Discount_Accounts")
             os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
             links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
             discount_count = 0
+            loop = asyncio.get_running_loop()
+            
             for filename in json_files:
                 file_path = os.path.join(src_accounts, filename)
                 try:
@@ -266,12 +281,14 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if access_token:
                             user_uuid = get_user_id_from_token(access_token)
                             if user_uuid:
-                                headers = BASE_HEADERS.copy()
+                                headers = get_anti_bot_headers()
                                 headers['Authorization'] = f'Bearer {access_token}'
                                 url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{user_uuid}"
-                                loop = asyncio.get_running_loop()
-                                response = await loop.run_in_executor(executor, lambda: requests.get(url, headers=headers, timeout=10))
-                                if response.status_code == 200 and response.json().get('data'):
+                                
+                                proxy_dict = await get_random_proxy_from_db()
+                                response = await loop.run_in_executor(executor, sync_api_request, url, headers, proxy_dict)
+                                
+                                if response and response.status_code == 200 and response.json().get('data'):
                                     discount_count += 1
                                     shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
                                     link_id = str(uuid.uuid4())[:12]
@@ -327,8 +344,10 @@ def get_admin_keyboard():
         [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("⏳ تنظیم انقضا", callback_data="admin_expire")],
         [InlineKeyboardButton("🎁 بررسی تخفیف دیتابیس", callback_data="admin_check_discounts")],
         [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("🔍 بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
-        [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی دیتابیس", callback_data="admin_clear")],
-        [InlineKeyboardButton("🔗 استخراج لینک‌ها با شماره", callback_data="admin_export_links")], # <--- دکمه جدید
+        [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی", callback_data="admin_clear")],
+        [InlineKeyboardButton("🔗 استخراج لینک‌ها", callback_data="admin_export_links"), InlineKeyboardButton("🔑 استخراج توکن‌ها", callback_data="admin_export_tokens")],
+        [InlineKeyboardButton("🛠 تعمیر لینک‌های ناقص (سریع)", callback_data="admin_repair_links")],
+        [InlineKeyboardButton("🌐 تنظیم پروکسی", callback_data="admin_set_proxy")], # <--- دکمه جدید برای پروکسی
         [InlineKeyboardButton("⏸ روشن/خاموش کردن", callback_data="admin_toggle")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ]
@@ -345,6 +364,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
+    context.user_data['admin_state'] = None
     context.user_data['admin_zip_action'] = None
     await update.message.reply_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
@@ -355,18 +375,32 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data == "main_menu":
+        context.user_data['admin_state'] = None
         await show_main_menu(update, context)
         return
         
     if not is_admin(user_id): return
+    context.user_data['admin_state'] = None # Reset text input state on any button press
     
     if data == "admin_panel":
         context.user_data['admin_zip_action'] = None
         await query.edit_message_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
         
+    elif data == "admin_set_proxy":
+        context.user_data['admin_state'] = 'waiting_for_proxy'
+        await query.edit_message_text(
+            "🌐 <b>تنظیم پروکسی‌ها:</b>\n\n"
+            "لطفاً لیست پروکسی‌های خود را (به صورت متن در همین پیام یا یک فایل `txt.`) ارسال کنید.\n\n"
+            "⚠️ <b>فرمت مجاز:</b> `user:pass@host:port` یا `http://user...`", 
+            parse_mode='Markdown'
+        )
+
     elif data == "admin_stats":
         acc_keys = await redis_client.keys("account:*")
         link_keys = await redis_client.keys("acc_link:*")
+        proxies_json = await redis_client.get("settings:proxies")
+        proxy_count = len(json.loads(proxies_json)) if proxies_json else 0
+        
         maint = await redis_client.get("settings:maintenance")
         exp = await redis_client.get("settings:expire_time")
         exp = int(exp) if exp else 7200
@@ -377,6 +411,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 <b>وضعیت سیستم:</b>\n\n"
             f"👤 <b>تعداد کل اکانت‌ها:</b> <code>{len(acc_keys)}</code>\n"
             f"🔗 <b>لینک‌های فعال:</b> <code>{len(link_keys)}</code>\n"
+            f"🌐 <b>تعداد پروکسی‌ها:</b> <code>{proxy_count}</code>\n"
             f"⏳ <b>زمان انقضای لینک‌ها:</b> {exp_str}\n"
             f"🤖 <b>وضعیت ربات:</b> {status}"
         )
@@ -399,10 +434,9 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_check_discounts":
         acc_keys = await redis_client.keys("account:*")
         if not acc_keys:
-            # بجای query.message.reply استفاده شد تا تحت هر شرایطی پیام ارسال شود
             await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
             return
-        await context.bot.send_message(chat_id=user_id, text="⏳ در حال پردازش اطلاعات دیتابیس. لطفاً منتظر بمانید...")
+        await context.bot.send_message(chat_id=user_id, text="⏳ در حال پردازش دیتابیس با سیستم ضدربات (پروکسی). لطفاً منتظر بمانید...")
         asyncio.create_task(process_discounts_and_send_report(context.bot, user_id, acc_keys))
         
     elif data == "admin_zip_to_link":
@@ -413,9 +447,6 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['admin_zip_action'] = 'zip_discount_check'
         await context.bot.send_message(chat_id=user_id, text="🔍 <b>عملیات بررسی تخفیف:</b>\nلطفاً فایل ZIP مربوطه را ارسال کنید.", parse_mode='HTML')
 
-    # ==========================
-    # اصلاح استخراج شماره ها
-    # ==========================
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
         if not acc_keys:
@@ -426,15 +457,11 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         file_out = io.BytesIO(export_text.encode('utf-8'))
         try:
-            # اضافه شدن filename الزامی برای رفع باگ ارسال فایل
             await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Accounts_{int(time.time())}.txt", caption="📥 فایل دیتابیس (شماره‌ها) دریافت شد.")
         except Exception as e:
             logging.error(f"Error sending export: {e}")
             await context.bot.send_message(chat_id=user_id, text="❌ خطا در ارسال فایل استخراج.")
 
-    # ==========================
-    # قابلیت جدید استخراج لینک ها با شماره
-    # ==========================
     elif data == "admin_export_links":
         link_keys = await redis_client.keys("acc_link:*")
         if not link_keys:
@@ -445,15 +472,12 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         export_text = "لیست لینک‌های فعال به همراه شماره:\n\n"
         count = 0
-        
         for l_key in link_keys:
             link_id = l_key.replace("acc_link:", "")
             final_url = f"{WEB_DOMAIN}/acc/{link_id}"
             link_data = await redis_client.get(l_key)
             phone = "نامشخص"
-            
             try:
-                # رمزگشایی و استخراج شماره تلفن از دیتای ذخیره شده
                 data_json = json.loads(link_data)
                 origins = data_json.get("origins", [])
                 if origins:
@@ -464,17 +488,76 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             break
             except Exception:
                 pass
-                
             export_text += f"📱 شماره: {phone}\n🔗 لینک: {final_url}\n\n"
             count += 1
             
         file_out = io.BytesIO(export_text.encode('utf-8'))
         try:
-            # اضافه شدن filename الزامی برای رفع باگ ارسال فایل
             await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Links_With_Phone_{int(time.time())}.txt", caption=f"✅ استخراج {count} لینک با موفقیت انجام شد.")
         except Exception as e:
             logging.error(f"Error sending links doc: {e}")
             await context.bot.send_message(chat_id=user_id, text="❌ خطا در ارسال فایل لینک‌ها.")
+
+    elif data == "admin_export_tokens":
+        acc_keys = await redis_client.keys("account:*")
+        if not acc_keys:
+            await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
+            return
+        await context.bot.send_message(chat_id=user_id, text="⏳ در حال استخراج توکن‌ها...")
+        exported_data = {}
+        for key in acc_keys:
+            phone = key.replace('account:', '')
+            tokens = await redis_client.hgetall(key)
+            exported_data[phone] = {
+                "access_token": tokens.get("access_token", ""),
+                "refresh_token": tokens.get("refresh_token", "")
+            }
+        json_data = json.dumps(exported_data, indent=4, ensure_ascii=False)
+        file_out = io.BytesIO(json_data.encode('utf-8'))
+        try:
+            await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Tokens_DB_{int(time.time())}.json", caption=f"🔑 فایل توکن‌های استخراج شده ({len(acc_keys)} شماره)")
+        except Exception as e:
+            logging.error(f"Error sending tokens doc: {e}")
+            await context.bot.send_message(chat_id=user_id, text="❌ خطا در ارسال فایل توکن‌ها.")
+
+    elif data == "admin_repair_links":
+        link_keys = await redis_client.keys("acc_link:*")
+        if not link_keys:
+            await context.bot.send_message(chat_id=user_id, text="⚠️ هیچ لینکی در سیستم جهت تعمیر وجود ندارد.")
+            return
+            
+        msg = await context.bot.send_message(chat_id=user_id, text="🛠 در حال بررسی و تعمیر لینک‌ها (عملیات دیتابیس داخلی - بدون خطر بن شدن)...")
+        repaired_count = 0
+        for l_key in link_keys:
+            try:
+                link_data = await redis_client.get(l_key)
+                data_json = json.loads(link_data)
+                phone = None
+                origins = data_json.get("origins", [])
+                if origins:
+                    for item in origins[0].get("localStorage", []):
+                        if item.get("name") == "user":
+                            user_obj = json.loads(urllib.parse.unquote(item.get("value")))
+                            phone = user_obj.get("mobilePhone")
+                            break
+                if phone:
+                    acc_data = await redis_client.hgetall(f"account:{phone}")
+                    r_tok = acc_data.get("refresh_token")
+                    t_ms = acc_data.get("access_token")
+                    if r_tok and t_ms:
+                        if "cookies" not in data_json:
+                            data_json["cookies"] = []
+                        data_json["cookies"] = [c for c in data_json["cookies"] if c.get("name") not in ["tokenMS", "token", "refresh_token"]]
+                        data_json["cookies"].append({"name": "tokenMS", "value": t_ms, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"})
+                        data_json["cookies"].append({"name": "token", "value": t_ms, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"})
+                        data_json["cookies"].append({"name": "refresh_token", "value": r_tok, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"})
+                        ttl = await redis_client.ttl(l_key)
+                        if ttl > 0:
+                            await redis_client.setex(l_key, ttl, json.dumps(data_json, ensure_ascii=False))
+                            repaired_count += 1
+            except Exception as e:
+                logging.error(f"Error repairing link {l_key}: {e}")
+        await msg.edit_text(f"✅ عملیات تعمیر پایان یافت.\nتعداد <b>{repaired_count}</b> لینک به صورت خودکار ترمیم شدند و رفرش‌توکن به آن‌ها اضافه شد.", parse_mode='HTML')
 
     elif data == "admin_clear":
         kb = [[InlineKeyboardButton("✅ تایید عملیات حذف", callback_data="admin_clear_confirm"), InlineKeyboardButton("❌ انصراف", callback_data="admin_panel")]]
@@ -493,21 +576,75 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⚙️ <b>تغییر وضعیت سیستم:</b>\nوضعیت کنونی: {status}", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
 # ==========================================
+# سیستم هندل کردن ورودی متنی / فایلی پروکسی
+# ==========================================
+async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id): return
+    
+    state = context.user_data.get('admin_state')
+    
+    # اگر منتظر دریافت پروکسی بودیم
+    if state == 'waiting_for_proxy':
+        text_content = ""
+        msg = await update.message.reply_text("⏳ در حال خواندن پروکسی‌ها...")
+        
+        try:
+            if update.message.document:
+                file_name = update.message.document.file_name.lower()
+                if not file_name.endswith('.txt'):
+                    await msg.edit_text("❌ فرمت فایل پروکسی باید `.txt` باشد.")
+                    return
+                file = await update.message.document.get_file()
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    await file.download_to_drive(temp_file.name)
+                    with open(temp_file.name, 'r', encoding='utf-8') as f:
+                        text_content = f.read()
+            else:
+                text_content = update.message.text
+                
+            proxies = []
+            for line in text_content.split('\n'):
+                line = line.strip()
+                if line:
+                    # اگر کاربر به فرمت user:pass@ip:port داد، پروتکل http را اولش اضافه میکنیم
+                    if not line.startswith('http') and not line.startswith('socks'):
+                        line = f"http://{line}"
+                    proxies.append(line)
+                    
+            if proxies:
+                await redis_client.set("settings:proxies", json.dumps(proxies))
+                context.user_data['admin_state'] = None
+                await msg.edit_text(f"✅ تعداد <b>{len(proxies)}</b> پروکسی با موفقیت ذخیره و برای بررسی تخفیف‌ها تنظیم شد.", reply_markup=get_admin_keyboard(), parse_mode='HTML')
+            else:
+                await msg.edit_text("⚠️ متنی حاوی پروکسی یافت نشد. لطفاً مجدداً امتحان کنید.")
+                
+        except Exception as e:
+            logging.error(f"Error reading proxies: {e}")
+            await msg.edit_text("❌ خطا در پردازش فایل یا متن پروکسی.")
+
+# ==========================================
 # توابع لاگین کاربر 
 # ==========================================
-async def async_request(method, url, **kwargs):
-    loop = asyncio.get_running_loop()
-    if method.upper() == 'POST': return await loop.run_in_executor(executor, lambda: requests.post(url, **kwargs))
-    return await loop.run_in_executor(executor, lambda: requests.get(url, **kwargs))
-
 def get_user_headers(context: ContextTypes.DEFAULT_TYPE):
     if 'device_id' not in context.user_data:
         context.user_data['device_id'] = str(uuid.uuid4())
         context.user_data['session_id'] = str(uuid.uuid4())
-    headers = BASE_HEADERS.copy()
+    headers = {
+        'accept': 'application/json, text/plain, */*',
+        'source': 'okala',
+        'ui-version': '2.0',
+        'origin': 'https://www.okala.com',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
+    }
     headers['X-User-Unique-Id'] = context.user_data['device_id']
     headers['session-id'] = context.user_data['session_id']
     return headers
+
+async def async_request(method, url, **kwargs):
+    loop = asyncio.get_running_loop()
+    if method.upper() == 'POST': return await loop.run_in_executor(executor, lambda: requests.post(url, **kwargs))
+    return await loop.run_in_executor(executor, lambda: requests.get(url, **kwargs))
 
 async def check_maintenance(update: Update) -> bool:
     maint = await redis_client.get("settings:maintenance")
@@ -667,6 +804,9 @@ async def main():
     application.add_handler(CommandHandler('start', show_main_menu))
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(MessageHandler(filters.Document.FileExtension("zip"), handle_zip_upload))
+    
+    # هندلر جدید برای گرفتن متن/فایل پروکسی از ادمین
+    application.add_handler(MessageHandler(filters.TEXT | filters.Document.FileExtension("txt"), handle_admin_text_document))
 
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_login_process, pattern="^user_login$")],
@@ -690,7 +830,6 @@ async def main():
     
     application.add_handler(conv_handler)
     
-    # دکمه‌های منوی اصلی و ادمین
     application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$"))
     
     await application.initialize()
