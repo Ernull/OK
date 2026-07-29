@@ -1,21 +1,21 @@
 import os
-import json
-import logging
+import shutil
 import asyncio
+import json
+import base64
+import requests
+import time
 import uuid
 import urllib.parse
-import time
 import io
-import base64
 import tempfile
-import shutil
 import random
-import requests
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
+import logging
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -23,7 +23,6 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
-
 ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
 
 PHONE, OTP, ASK_NAME = range(3)
@@ -46,7 +45,7 @@ def get_anti_bot_headers():
         'ui-version': '2.0',
         'origin': 'https://www.okala.com',
         'User-Agent': random.choice(USER_AGENTS),
-        'X-User-Unique-Id': str(uuid.uuid4()), # ساخت آیدی موبایل جدید برای هر درخواست
+        'X-User-Unique-Id': str(uuid.uuid4()), 
         'X-Correlation-Id': str(uuid.uuid4()),
         'session-id': str(uuid.uuid4())
     }
@@ -67,7 +66,6 @@ async def get_random_proxy_from_db():
     return None
 
 def sync_api_request(url, headers, proxy_dict):
-    # تاخیر تصادفی بین 1.5 تا 3.5 ثانیه برای شبیه‌سازی رفتار انسان
     time.sleep(random.uniform(1.5, 3.5)) 
     try:
         return requests.get(url, headers=headers, proxies=proxy_dict, timeout=15)
@@ -91,7 +89,7 @@ def get_user_id_from_token(token):
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     report_text = "🎁 <b>گزارش کدهای تخفیف (دیتابیس):</b>\n\n"
     found_any = False
-    
+    debug_logs = []
     loop = asyncio.get_running_loop()
     
     for key in acc_keys:
@@ -111,15 +109,20 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             proxy_dict = await get_random_proxy_from_db()
             response = await loop.run_in_executor(executor, sync_api_request, url, headers, proxy_dict)
             
-            if response and response.status_code == 200:
-                data = response.json()
-                vouchers = data.get('data', [])
-                if vouchers:
-                    found_any = True
-                    report_text += f"📱 شماره {phone}: دارای <b>{len(vouchers)}</b> تخفیف\n"
+            if response:
+                debug_logs.append(f"[{phone}] Status: {response.status_code}\nResponse: {response.text}\n{'-'*40}\n")
+                if response.status_code == 200:
+                    data = response.json()
+                    vouchers = data.get('data', [])
+                    if vouchers:
+                        found_any = True
+                        report_text += f"📱 شماره {phone}: دارای <b>{len(vouchers)}</b> تخفیف\n"
+            else:
+                debug_logs.append(f"[{phone}] Status: Timeout / Network Error\n{'-'*40}\n")
+                
         except Exception as e:
             logging.error(f"Discount check error for {key}: {e}")
-            pass
+            debug_logs.append(f"[{key}] Exception: {str(e)}\n{'-'*40}\n")
             
     if not found_any: report_text += "هیچ تخفیفی یافت نشد."
     
@@ -129,6 +132,11 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             await bot.send_document(chat_id=chat_id, document=file_out, filename=f"Discounts_Report_{int(time.time())}.txt", caption="✅ گزارش کامل تخفیف‌ها")
         else:
             await bot.send_message(chat_id=chat_id, text=report_text, parse_mode='HTML')
+            
+        if debug_logs:
+            debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
+            await bot.send_document(chat_id=chat_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
+            
     except Exception as e:
         logging.error(f"Error sending report doc: {e}")
         await bot.send_message(chat_id=chat_id, text="❌ خطا در ارسال فایل گزارش.")
@@ -263,6 +271,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
             links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
             discount_count = 0
+            debug_logs = []
             loop = asyncio.get_running_loop()
             
             for filename in json_files:
@@ -272,6 +281,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         file_content = f.read()
                         data = json.loads(file_content)
                         access_token = None
+                        phone = filename.replace('.json', '')
                         for cookie in data.get('cookies', []):
                             if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
                         if not access_token:
@@ -288,15 +298,19 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 proxy_dict = await get_random_proxy_from_db()
                                 response = await loop.run_in_executor(executor, sync_api_request, url, headers, proxy_dict)
                                 
-                                if response and response.status_code == 200 and response.json().get('data'):
-                                    discount_count += 1
-                                    shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
-                                    link_id = str(uuid.uuid4())[:12]
-                                    await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
-                                    phone = filename.replace('.json', '')
-                                    links_text += f"📱 <b>شماره {phone}:</b>\n{WEB_DOMAIN}/acc/{link_id}\n\n"
-                except Exception:
-                    pass
+                                if response:
+                                    debug_logs.append(f"[{phone}] Status: {response.status_code}\nResponse: {response.text}\n{'-'*40}\n")
+                                    if response.status_code == 200 and response.json().get('data'):
+                                        discount_count += 1
+                                        shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
+                                        link_id = str(uuid.uuid4())[:12]
+                                        await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
+                                        links_text += f"📱 <b>شماره {phone}:</b>\n{WEB_DOMAIN}/acc/{link_id}\n\n"
+                                else:
+                                    debug_logs.append(f"[{phone}] Status: Timeout / Network Error\n{'-'*40}\n")
+                except Exception as e:
+                    debug_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
+                    
             if discount_count > 0:
                 discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
@@ -310,6 +324,10 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
             else:
                 await msg.edit_text("⚠️ هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
+                
+            if debug_logs:
+                debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
+                await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
 
 # ==========================================
 # مینی‌سرور وب
@@ -347,7 +365,7 @@ def get_admin_keyboard():
         [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی", callback_data="admin_clear")],
         [InlineKeyboardButton("🔗 استخراج لینک‌ها", callback_data="admin_export_links"), InlineKeyboardButton("🔑 استخراج توکن‌ها", callback_data="admin_export_tokens")],
         [InlineKeyboardButton("🛠 تعمیر لینک‌های ناقص (سریع)", callback_data="admin_repair_links")],
-        [InlineKeyboardButton("🌐 تنظیم پروکسی", callback_data="admin_set_proxy")], # <--- دکمه جدید برای پروکسی
+        [InlineKeyboardButton("🌐 تنظیم پروکسی", callback_data="admin_set_proxy")], 
         [InlineKeyboardButton("⏸ روشن/خاموش کردن", callback_data="admin_toggle")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ]
@@ -380,7 +398,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     if not is_admin(user_id): return
-    context.user_data['admin_state'] = None # Reset text input state on any button press
+    context.user_data['admin_state'] = None 
     
     if data == "admin_panel":
         context.user_data['admin_zip_action'] = None
@@ -584,7 +602,6 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
     
     state = context.user_data.get('admin_state')
     
-    # اگر منتظر دریافت پروکسی بودیم
     if state == 'waiting_for_proxy':
         text_content = ""
         msg = await update.message.reply_text("⏳ در حال خواندن پروکسی‌ها...")
@@ -607,7 +624,6 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
             for line in text_content.split('\n'):
                 line = line.strip()
                 if line:
-                    # اگر کاربر به فرمت user:pass@ip:port داد، پروتکل http را اولش اضافه میکنیم
                     if not line.startswith('http') and not line.startswith('socks'):
                         line = f"http://{line}"
                     proxies.append(line)
@@ -651,9 +667,9 @@ async def check_maintenance(update: Update) -> bool:
     user_id = update.effective_user.id if update.effective_user else 0
     if maint == "1" and not is_admin(user_id):
         if update.message:
-            await update.message.reply_text("⛔️ سیستم لینک ساز در حال حاضر موقتاً غیرفعال است.")
+            await update.message.reply_text("⛔️ سیستم در حال حاضر موقتاً غیرفعال است.")
         else:
-            await update.callback_query.message.reply_text("⛔️ سیستم لینک ساز در حال حاضر موقتاً غیرفعال است.")
+            await update.callback_query.message.reply_text("⛔️ سیستم در حال حاضر موقتاً غیرفعال است.")
         return True
     return False
 
@@ -805,9 +821,7 @@ async def main():
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(MessageHandler(filters.Document.FileExtension("zip"), handle_zip_upload))
     
-    # هندلر جدید برای گرفتن متن/فایل پروکسی از ادمین
-    application.add_handler(MessageHandler(filters.TEXT | filters.Document.FileExtension("txt"), handle_admin_text_document))
-
+    # 1. هندلر مکالمه (لاگین) در اولویت قرار می‌گیرد تا تداخل ایجاد نشود
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_login_process, pattern="^user_login$")],
         states={
@@ -827,11 +841,14 @@ async def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-    
     application.add_handler(conv_handler)
     
+    # 2. هندلر دکمه‌های شیشه‌ای
     application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$"))
     
+    # 3. هندلر دریافت متن و پروکسی ادمین در انتها قرار می‌گیرد
+    application.add_handler(MessageHandler(filters.TEXT | filters.Document.FileExtension("txt"), handle_admin_text_document))
+
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
