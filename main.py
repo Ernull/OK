@@ -296,39 +296,8 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == 'zip_to_link':
-            links_text = "<b>لیست لینک‌های تولید شده:</b>\n\n"
-            count = 0
-            for file_path in json_files_paths:
-                filename = os.path.basename(file_path)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                        data = json.loads(file_content)
-                        access_token, refresh_token = None, None
-                        for cookie in data.get('cookies', []):
-                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                            elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-                        if not access_token:
-                            for origin in data.get('origins', []):
-                                for item in origin.get('localStorage', []):
-                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
-                                    elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
-                        phone = filename.replace('.json', '')
-                        if access_token and not await redis_client.exists(f"account:{phone}"):
-                            await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
-                        link_id = str(uuid.uuid4())[:12]
-                        await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
-                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                        links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
-                        count += 1
-                except Exception:
-                    pass
-            if len(links_text) > 4000:
-                file_out = io.BytesIO(links_text.encode('utf-8'))
-                await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Links_{int(time.time())}.txt", caption=f"✅ استخراج {count} اکانت انجام شد.")
-                await msg.delete()
-            else:
-                await msg.edit_text(f"✅ <b>تعداد {count} اکانت ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
+            # ساخت لینک از زیپ غیرفعال شده - فضای دیتابیس پر شده
+            await msg.edit_text("⚠️ <b>خطا: فضای دیتابیس پر شده است.</b>\n\nامکان ساخت لینک جدید وجود ندارد.", parse_mode='HTML')
 
         elif action == 'zip_discount_check':
             await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها با سیستم ضدربات و رفرش‌توکن. لطفاً منتظر بمانید...")
@@ -1098,47 +1067,18 @@ async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_T
     return await generate_and_send_link(update, context, msg)
 
 async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg) -> int:
-    auth_data = context.user_data.get('auth_data')
-    phone = context.user_data.get('phone', 'نامشخص')
-    injection_json = format_for_injector(auth_data)
-    link_id = str(uuid.uuid4())[:12]
-    
-    expire_time = await redis_client.get("settings:expire_time")
-    expire_time = int(expire_time) if expire_time else 7200
-    await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
-    
-    final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-    
-    if 'session_links' not in context.user_data:
-        context.user_data['session_links'] = []
-    context.user_data['session_links'].append({"phone": phone, "link": final_url})
-    
-    tg_user = update.effective_user
-    log_entry = {
-        "tg_id": tg_user.id,
-        "tg_name": tg_user.full_name or "نامشخص",
-        "tg_user": tg_user.username or "",
-        "phone": phone,
-        "link": final_url,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    await redis_client.rpush("global_link_logs", json.dumps(log_entry, ensure_ascii=False))
-    
-    count = len(context.user_data['session_links'])
-    
+    # ساخت لینک غیرفعال شده - فضای دیتابیس پر شده
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ ساخت لینک برای یک خط دیگر", callback_data="user_login")],
-        [InlineKeyboardButton("🏁 پایان لینک ساختن", callback_data="finish_link_creation")],
+        [InlineKeyboardButton("📞 تماس با مدیر", callback_data="contact_admin")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ])
-    
-    text = (
-        f"✅ <b>ورود به حساب شماره {phone} با موفقیت انجام شد.</b>\n\n"
-        f"📥 لینک تولید شد و آماده تحویل است.\n"
-        f"📊 تعداد لینک‌های آماده ارسال در این نوبت: <b>{count}</b>\n\n"
-        "می‌توانید شماره دیگری اضافه کنید یا دکمه <b>«🏁 پایان لینک ساختن»</b> را بزنید."
+    await status_msg.edit_text(
+        "⚠️ <b>خطا: فضای دیتابیس پر شده است.</b>\n\n"
+        "متأسفانه در حال حاضر امکان ساخت لینک جدید وجود ندارد.\n"
+        "برای اطلاعات بیشتر و رفع مشکل با مدیریت تماس بگیرید.",
+        reply_markup=kb,
+        parse_mode='HTML'
     )
-    await status_msg.edit_text(text, reply_markup=kb, parse_mode='HTML')
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
