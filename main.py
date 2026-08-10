@@ -10,6 +10,7 @@ import urllib.parse
 import io
 import tempfile
 import random
+import re
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
@@ -26,7 +27,7 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
 ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
 
-PHONE, OTP, ASK_NAME, ASK_TAG, ASK_SEARCH = range(5)
+PHONE, OTP, ASK_NAME, ASK_TAG, ASK_SEARCH, ASK_LINKS_FOR_DISCOUNT = range(6)
 
 # محدود کردن Worker ها
 executor = ThreadPoolExecutor(max_workers=5)
@@ -36,7 +37,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 12; Pixel 6 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile"
 ]
 
 def get_anti_bot_headers():
@@ -67,25 +69,15 @@ async def get_random_proxy_from_db():
     return None
 
 def get_user_id_from_token(token):
+    # بر اساس منطق فایل سالم (اسکریپت دوم)
     try:
         payload = token.split('.')[1]
         payload += '=' * (-len(payload) % 4)
         decoded_bytes = base64.urlsafe_b64decode(payload)
         data = json.loads(decoded_bytes)
-        # The discount endpoint expects the numeric customer id.  Newer tokens
-        # also contain cerberusId, which is often a UUID and must not be
-        # selected before userId/alternativeCustomerId.
-        for claim in ('userId', 'alternativeCustomerId', 'sub', 'cerberusId'):
-            value = data.get(claim)
-            if value is None or value == '':
-                continue
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-        return 0
+        return data.get('cerberusId') or data.get('alternativeCustomerId')
     except Exception:
-        return 0
+        return None
 
 def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
     try:
@@ -99,54 +91,65 @@ def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
 class OkalaAPI:
     def __init__(self):
         self.request_logs = []
-        self.base_headers = {
-            'accept': 'application/json, text/plain, */*',
-            'source': 'okala',
-            'ui-version': '2.0',
-            'origin': 'https://www.okala.com',
-            'User-Agent': random.choice(USER_AGENTS),
-            'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
-            'sec-ch-ua-mobile': '?1',
-            'sec-ch-ua-platform': '"Android"',
-        }
 
     def log_request(self, method, url, status_code, response_text):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.request_logs.append(f"[{timestamp}] {method} {url}\nStatus: {status_code}\nResponse: {response_text}\n{'-'*50}\n")
 
-    def make_request(self, method, url, access_token=None, proxy_dict=None, **kwargs):
-        headers = self.base_headers.copy()
-        headers['X-Correlation-Id'] = str(uuid.uuid4())
-        headers['X-User-Unique-Id'] = str(uuid.uuid4())
-        headers['session-id'] = str(uuid.uuid4())
-        if access_token: headers['Authorization'] = f'Bearer {access_token}'
-        if 'headers' in kwargs: headers.update(kwargs.pop('headers'))
-
+    def check_discount_api(self, token, uid, proxy_dict=None):
+        url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{uid}"
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json, text/plain, */*',
+            'source': 'okala',
+            'ui-version': '2.0',
+            'origin': 'https://www.okala.com',
+            'X-Correlation-Id': str(uuid.uuid4()),
+            'X-User-Unique-Id': str(uuid.uuid4()),
+            'session-id': str(uuid.uuid4()),
+            'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+            'sec-ch-ua-mobile': '?1',
+            'sec-ch-ua-platform': '"Android"',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
+        }
         for attempt in range(3):
             try:
                 time.sleep(random.uniform(1.0, 2.5))
-                res = requests.request(method, url, headers=headers, proxies=proxy_dict, timeout=25, **kwargs)
-                self.log_request(method, url, res.status_code, res.text)
+                res = requests.get(url, headers=headers, proxies=proxy_dict, timeout=45)
+                self.log_request('GET', url, res.status_code, res.text)
                 if res.status_code == 200:
                     try: return 200, res.json()
                     except: return 200, {}
                 elif res.status_code == 401: return 401, {}
                 else: return res.status_code, res.text 
             except Exception as e:
-                self.log_request(method, url, "EXCEPTION", str(e))
+                self.log_request('GET', url, "EXCEPTION", str(e))
                 time.sleep(1)
         return 0, "Network Error"
 
-    def check_discount_api(self, token, uid, proxy_dict=None):
-        url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{uid}"
-        return self.make_request('GET', url, access_token=token, proxy_dict=proxy_dict)
-
     def refresh_token(self, refresh_token, proxy_dict=None):
         url = "https://apigateway.okala.com/api/v1/accounts/tokens"
-        data = {"grant_type": "refresh_token", "client_id": "customer_client_id", "client_secret": "u_M{'57j!%LI21#", "scope": "offline_access", "refresh_token": refresh_token}
-        status, response_data = self.make_request('POST', url, headers={"content-type": "application/x-www-form-urlencoded"}, data=data, proxy_dict=proxy_dict)
-        if status == 200 and isinstance(response_data, dict):
-            return response_data.get('access_token'), response_data.get('refresh_token')
+        payload = {
+            "grant_type": "refresh_token", 
+            "client_id": "customer_client_id", 
+            "client_secret": "u_M{'57j!%LI21#", 
+            "scope": "offline_access", 
+            "refresh_token": refresh_token
+        }
+        headers = {
+            "content-type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile"
+        }
+        for attempt in range(3):
+            try:
+                res = requests.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=45)
+                self.log_request('POST', url, res.status_code, res.text)
+                if res.status_code == 200:
+                    data = res.json()
+                    return data.get('access_token'), data.get('refresh_token')
+            except Exception as e:
+                self.log_request('POST', url, "EXCEPTION", str(e))
+                pass
         return None, None
 
 # ==========================================
@@ -157,7 +160,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     api = OkalaAPI()
     ts = int(time.time())
 
-    # بررسی وجود پروکسی
     proxy_check = await get_random_proxy_from_db()
     if not proxy_check:
         await bot.send_message(
@@ -168,7 +170,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             parse_mode='HTML'
         )
 
-    # استخراج لینک‌های ثبت‌شده از لاگ دیتابیس
     raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
     phone_to_latest_link = {}
     for item in raw_logs:
@@ -185,7 +186,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         parse_mode='HTML'
     )
 
-    # لاگ تفصیلی هر بررسی
     detail_logs = []
 
     def _check_sync(acc_token, ref_token, uid, p_dict, phone):
@@ -220,7 +220,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 
         return status, res, None, None, log_line
 
-    # پردازش اکانت‌ها
     discount_results = []
     done = 0
 
@@ -266,7 +265,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
                     })
 
             done += 1
-            # آپدیت پیشرفت هر ۵ اکانت یا آخرین اکانت
             if done % 5 == 0 or done == total:
                 try:
                     await progress_msg.edit_text(
@@ -282,7 +280,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
             logging.error(f"Discount check error for {key}: {e}")
 
-    # ساخت گزارش نهایی
     if discount_results:
         report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
         for r in discount_results:
@@ -296,7 +293,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     else:
         report_text = f"➖ <b>هیچ تخفیفی یافت نشد.</b>\nتعداد کل اکانت‌های بررسی‌شده: {total}"
 
-    # ارسال گزارش تخفیف‌ها
     try:
         await progress_msg.delete()
     except Exception:
@@ -315,7 +311,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     except Exception as e:
         logging.error(f"Error sending discount report: {e}")
 
-    # ارسال لاگ تفصیلی
     try:
         full_log = f"=== لاگ بررسی تخفیف | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
         full_log += f"کل اکانت‌ها: {total} | دارای تخفیف: {len(discount_results)}\n"
@@ -576,6 +571,9 @@ def get_main_keyboard(is_admin_user, active_tag_name=None):
         InlineKeyboardButton("🔍 جستجوی لینک", callback_data="search_links")
     ])
     
+    # دکمه جدید برای بررسی تخفیف لینک‌ها
+    keyboard.append([InlineKeyboardButton("🎁 بررسی تخفیف لینک‌ها", callback_data="check_user_links")])
+    
     keyboard.append([InlineKeyboardButton("📞 تماس با مدیر", callback_data="contact_admin")])
     
     if is_admin_user:
@@ -706,6 +704,112 @@ async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # ==========================================
+# سیستم جدید: بررسی تخفیف لینک‌های ارسال شده کاربر
+# ==========================================
+async def ask_user_links_for_discount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data="cancel_action")]])
+    text = (
+        "🎁 <b>بررسی وضعیت تخفیف لینک‌ها</b>\n\n"
+        "لطفاً لینک‌های تولید شده (یا شناسه‌های انتهای لینک) را ارسال کنید.\n"
+        "می‌توانید چند لینک را زیر هم قرار داده و با یک پیام ارسال کنید تا ربات همه را همزمان بررسی کند."
+    )
+    await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode='HTML')
+    return ASK_LINKS_FOR_DISCOUNT
+
+async def process_user_links_discount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    
+    # پیدا کردن تمامی IDها در پیام کاربر
+    found_ids = []
+    lines = text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        match = re.search(r'/acc/([a-zA-Z0-9_-]+)', line)
+        if match:
+            found_ids.append((line, match.group(1)))
+        else:
+            # احتمال اینکه فقط آیدی را فرستاده باشند
+            found_ids.append((line, line))
+            
+    if not found_ids:
+        await update.message.reply_text("❌ هیچ لینک معتبری یافت نشد. به منوی اصلی بازمی‌گردید.")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+
+    msg = await update.message.reply_text(f"⏳ در حال بررسی <b>{len(found_ids)}</b> لینک... لطفاً منتظر بمانید.", parse_mode='HTML')
+    
+    api = OkalaAPI()
+    loop = asyncio.get_running_loop()
+    report = "🎁 <b>گزارش بررسی تخفیف لینک‌های شما:</b>\n\n"
+    
+    for original_text, link_id in found_ids:
+        data = await redis_client.get(f"acc_link:{link_id}")
+        if not data:
+            report += f"🔗 <code>{original_text}</code>\n❌ <i>لینک نامعتبر یا منقضی شده در سیستم</i>\n\n"
+            continue
+            
+        data_json = json.loads(data)
+        access_token = None
+        refresh_token = None
+        
+        for cookie in data_json.get('cookies', []):
+            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+            if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+        
+        if not access_token:
+            for origin in data_json.get('origins', []):
+                for item in origin.get('localStorage', []):
+                    if item.get('name') == 'tokenMS': access_token = item.get('value')
+                    if item.get('name') == 'refresh_token': refresh_token = item.get('value')
+        
+        if not access_token:
+            report += f"🔗 <code>{original_text}</code>\n❌ <i>توکن احراز هویت در این لینک یافت نشد</i>\n\n"
+            continue
+            
+        user_uuid = get_user_id_from_token(access_token)
+        if not user_uuid:
+            report += f"🔗 <code>{original_text}</code>\n❌ <i>آیدی کاربر (UUID) قابل شناسایی نیست</i>\n\n"
+            continue
+            
+        proxy_dict = await get_random_proxy_from_db()
+        
+        def _do_check():
+            status, res = api.check_discount_api(access_token, user_uuid, proxy_dict)
+            if status == 401 and refresh_token:
+                new_acc, new_ref = api.refresh_token(refresh_token, proxy_dict)
+                if new_acc:
+                    return api.check_discount_api(new_acc, user_uuid, proxy_dict)
+            return status, res
+            
+        status, res = await loop.run_in_executor(executor, _do_check)
+        
+        if status == 200 and isinstance(res, dict):
+            vouchers = res.get('data', [])
+            if vouchers:
+                amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
+                max_amount = max(amounts) // 10000 if amounts else 0
+                report += f"🔗 <code>{original_text}</code>\n✅ <b>تخفیف دارد!</b> مبلغ: {max_amount} هزار تومان\n\n"
+            else:
+                report += f"🔗 <code>{original_text}</code>\n➖ <i>تخفیف ندارد</i>\n\n"
+        elif status == 401:
+            report += f"🔗 <code>{original_text}</code>\n🔒 <i>توکن منقضی شده است و رفرش نشد</i>\n\n"
+        else:
+            report += f"🔗 <code>{original_text}</code>\n⚠️ <i>خطا در ارتباط با اکالا ({status})</i>\n\n"
+
+    if len(report) > 4000:
+        file_out = io.BytesIO(report.encode('utf-8'))
+        await context.bot.send_document(chat_id=update.effective_user.id, document=file_out, filename=f"Links_Discount_Report.txt", caption="✅ گزارش کامل بررسی تخفیف‌ها")
+        await msg.delete()
+    else:
+        await msg.edit_text(report, parse_mode='HTML', disable_web_page_preview=True)
+        
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+
+# ==========================================
 # مدیریت دکمه‌های اصلی و ادمین
 # ==========================================
 async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -724,7 +828,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📞 <b>ارتباط با مدیریت:</b>\n\n"
             "جهت هرگونه سوال، پیشنهاد یا گزارش مشکل به آیدی زیر پیام دهید:\n"
-            "@@NAVLINK_1",
+            "@Baran_arj2281",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]]),
             parse_mode='HTML'
         )
@@ -1290,7 +1394,8 @@ async def main():
         entry_points=[
             CallbackQueryHandler(start_login_process, pattern="^user_login$"),
             CallbackQueryHandler(ask_tag_name, pattern="^set_tag$"),
-            CallbackQueryHandler(ask_search_query, pattern="^search_links$")
+            CallbackQueryHandler(ask_search_query, pattern="^search_links$"),
+            CallbackQueryHandler(ask_user_links_for_discount, pattern="^check_user_links$")
         ],
         states={
             PHONE: [
@@ -1309,6 +1414,9 @@ async def main():
             ],
             ASK_SEARCH: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_search_query)
+            ],
+            ASK_LINKS_FOR_DISCOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_user_links_discount)
             ]
         },
         fallbacks=[
