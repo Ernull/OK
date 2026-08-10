@@ -69,7 +69,6 @@ async def get_random_proxy_from_db():
     return None
 
 def get_user_id_from_token(token):
-    # بر اساس منطق فایل سالم (اسکریپت دوم)
     try:
         payload = token.split('.')[1]
         payload += '=' * (-len(payload) % 4)
@@ -280,6 +279,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
             logging.error(f"Discount check error for {key}: {e}")
 
+    # آماده‌سازی و ارسال دو فایل گزارش
     if discount_results:
         report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
         for r in discount_results:
@@ -299,34 +299,30 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         pass
 
     try:
-        if len(report_text) > 4000:
-            file_out = io.BytesIO(report_text.encode('utf-8'))
-            await bot.send_document(
-                chat_id=chat_id, document=file_out,
-                filename=f"Discounts_Report_{ts}.txt",
-                caption=f"✅ گزارش کامل تخفیف‌ها — {len(discount_results)} اکانت دارای تخفیف"
-            )
-        else:
-            await bot.send_message(chat_id=chat_id, text=report_text, parse_mode='HTML', disable_web_page_preview=True)
-    except Exception as e:
-        logging.error(f"Error sending discount report: {e}")
-
-    try:
+        # 1. ارسال فایل گزارش تخفیف‌ها
+        report_out = io.BytesIO(report_text.encode('utf-8'))
+        await bot.send_document(
+            chat_id=chat_id, document=report_out,
+            filename=f"Discounts_Report_{ts}.txt",
+            caption=f"✅ فایل گزارش تخفیف‌ها — {len(discount_results)} اکانت دارای تخفیف"
+        )
+        
+        # 2. ارسال فایل لاگ‌های اکالا
         full_log = f"=== لاگ بررسی تخفیف | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
         full_log += f"کل اکانت‌ها: {total} | دارای تخفیف: {len(discount_results)}\n"
         full_log += "=" * 50 + "\n\n"
         full_log += "".join(detail_logs)
-        full_log += "\n\n=== لاگ درخواست‌های HTTP ===\n"
+        full_log += "\n\n=== لاگ درخواست‌های HTTP اکالا ===\n"
         full_log += "".join(api.request_logs)
 
         log_out = io.BytesIO(full_log.encode('utf-8'))
         await bot.send_document(
             chat_id=chat_id, document=log_out,
-            filename=f"Discount_Full_Log_{ts}.txt",
-            caption=f"📄 لاگ کامل بررسی ({total} اکانت)"
+            filename=f"Okala_Logs_{ts}.txt",
+            caption=f"📄 گزارش لاگ‌های سیستم و اکالا"
         )
     except Exception as e:
-        logging.error(f"Error sending log file: {e}")
+        logging.error(f"Error sending log files: {e}")
 
 # ==========================================
 # تبدیل دیتا برای وب
@@ -519,24 +515,31 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
                     
             debug_logs = api.request_logs
+            ts = int(time.time())
             
+            try:
+                await msg.delete()
+            except Exception: pass
+
             if discount_count > 0:
                 discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
                 await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
-                await msg.delete()
+                
                 with open(discount_zip_path + '.zip', 'rb') as zip_file:
                     await context.bot.send_document(chat_id=user_id, document=zip_file, filename="Discounted_Accounts.zip", caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
-                if len(links_text) > 4000:
-                    file_out = io.BytesIO(links_text.encode('utf-8'))
-                    await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Discount_Links_{int(time.time())}.txt", caption="🔗 لینک‌های دسترسی سریع")
-                else:
-                    await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
-            else:
-                await msg.edit_text("⚠️ هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
                 
+                # 1. فایل گزارش تخفیف‌ها
+                links_out = io.BytesIO(links_text.encode('utf-8'))
+                await context.bot.send_document(chat_id=user_id, document=links_out, filename=f"Discount_Report_{ts}.txt", caption="✅ گزارش لینک‌های دارای تخفیف")
+            else:
+                # 1. فایل گزارش تخفیف‌ها در صورت عدم تخفیف
+                report_out = io.BytesIO("هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.".encode('utf-8'))
+                await context.bot.send_document(chat_id=user_id, document=report_out, filename=f"Discount_Report_{ts}.txt", caption="⚠️ گزارش تخفیف‌ها (تخفیفی یافت نشد)")
+                
+            # 2. فایل لاگ‌های اکالا
             if debug_logs:
                 debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
-                await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
+                await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Okala_Logs_{ts}.txt", caption="📄 گزارش لاگ‌های اکالا (API)")
 
 # ==========================================
 # مینی‌سرور وب
@@ -798,12 +801,30 @@ async def process_user_links_discount(update: Update, context: ContextTypes.DEFA
         else:
             report += f"🔗 <code>{original_text}</code>\n⚠️ <i>خطا در ارتباط با اکالا ({status})</i>\n\n"
 
-    if len(report) > 4000:
-        file_out = io.BytesIO(report.encode('utf-8'))
-        await context.bot.send_document(chat_id=update.effective_user.id, document=file_out, filename=f"Links_Discount_Report.txt", caption="✅ گزارش کامل بررسی تخفیف‌ها")
+    try:
         await msg.delete()
-    else:
-        await msg.edit_text(report, parse_mode='HTML', disable_web_page_preview=True)
+    except Exception: pass
+
+    ts = int(time.time())
+    
+    # 1. فایل گزارش تخفیف‌ها
+    report_out = io.BytesIO(report.encode('utf-8'))
+    await context.bot.send_document(
+        chat_id=update.effective_user.id, 
+        document=report_out, 
+        filename=f"Discount_Report_{ts}.txt", 
+        caption="✅ گزارش وضعیت تخفیف لینک‌ها"
+    )
+    
+    # 2. فایل لاگ‌های اکالا
+    if api.request_logs:
+        log_out = io.BytesIO("".join(api.request_logs).encode('utf-8'))
+        await context.bot.send_document(
+            chat_id=update.effective_user.id, 
+            document=log_out, 
+            filename=f"Okala_Logs_{ts}.txt", 
+            caption="📄 گزارش لاگ‌های اکالا (API)"
+        )
         
     await show_main_menu(update, context)
     return ConversationHandler.END
