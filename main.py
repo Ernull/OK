@@ -13,6 +13,7 @@ import random
 import redis.asyncio as redis 
 from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
+from datetime import datetime
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 import logging
@@ -71,8 +72,18 @@ def get_user_id_from_token(token):
         payload += '=' * (-len(payload) % 4)
         decoded_bytes = base64.urlsafe_b64decode(payload)
         data = json.loads(decoded_bytes)
-        uid = data.get('cerberusId') or data.get('alternativeCustomerId') or data.get('userId')
-        return int(uid) if uid else 0
+        # The discount endpoint expects the numeric customer id.  Newer tokens
+        # also contain cerberusId, which is often a UUID and must not be
+        # selected before userId/alternativeCustomerId.
+        for claim in ('userId', 'alternativeCustomerId', 'sub', 'cerberusId'):
+            value = data.get(claim)
+            if value is None or value == '':
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
     except Exception:
         return 0
 
@@ -713,7 +724,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📞 <b>ارتباط با مدیریت:</b>\n\n"
             "جهت هرگونه سوال، پیشنهاد یا گزارش مشکل به آیدی زیر پیام دهید:\n"
-            "@NAVLINK_1",
+            "@@NAVLINK_1",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]]),
             parse_mode='HTML'
         )
