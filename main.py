@@ -27,6 +27,9 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
 ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
 
+# آیدی ادمین تایید کننده دسترسی تخفیف
+MASTER_ADMIN_ID = 7647481054
+
 PHONE, OTP, ASK_NAME, ASK_TAG, ASK_SEARCH, ASK_LINKS_FOR_DISCOUNT = range(6)
 
 # محدود کردن Worker ها
@@ -57,20 +60,20 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # ==========================================
-# سیستم بلاک کردن کاربران برای دکمه بررسی تخفیف
+# سیستم دسترسی کاربران برای دکمه بررسی تخفیف
 # ==========================================
-async def is_user_blocked_for_discount(user_id):
-    """بررسی اینکه آیا کاربر برای دکمه بررسی تخفیف مسدود است"""
-    blocked = await redis_client.sismember("blocked_users:discount", str(user_id))
-    return bool(blocked)
+async def is_user_approved_for_discount(user_id):
+    if is_admin(user_id) or user_id == MASTER_ADMIN_ID:
+        return True
+    approved = await redis_client.sismember("approved_users:discount", str(user_id))
+    return bool(approved)
 
-async def block_user_for_discount(user_id):
-    """مسدود کردن کاربر برای دکمه بررسی تخفیف"""
-    await redis_client.sadd("blocked_users:discount", str(user_id))
+async def approve_user_for_discount(user_id):
+    await redis_client.sadd("approved_users:discount", str(user_id))
+    await redis_client.delete(f"pending_req:discount:{user_id}")
 
-async def unblock_user_for_discount(user_id):
-    """آزاد کردن کاربر برای دکمه بررسی تخفیف"""
-    await redis_client.srem("blocked_users:discount", str(user_id))
+async def remove_user_pending_req(user_id):
+    await redis_client.delete(f"pending_req:discount:{user_id}")
 
 # ==========================================
 # سیستم مدیریت پروکسی و API
@@ -295,7 +298,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
             logging.error(f"Discount check error for {key}: {e}")
 
-    # آماده‌سازی و ارسال دو فایل گزارش
     if discount_results:
         report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
         for r in discount_results:
@@ -315,7 +317,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         pass
 
     try:
-        # 1. ارسال فایل گزارش تخفیف‌ها
         report_out = io.BytesIO(report_text.encode('utf-8'))
         await bot.send_document(
             chat_id=chat_id, document=report_out,
@@ -323,7 +324,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             caption=f"✅ فایل گزارش تخفیف‌ها — {len(discount_results)} اکانت دارای تخفیف"
         )
         
-        # 2. ارسال فایل لاگ‌های اکالا
         full_log = f"=== لاگ بررسی تخفیف | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
         full_log += f"کل اکانت‌ها: {total} | دارای تخفیف: {len(discount_results)}\n"
         full_log += "=" * 50 + "\n\n"
@@ -430,6 +430,14 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for file_path in json_files_paths:
                 filename = os.path.basename(file_path)
                 try:
+                    phone = filename.replace('.json', '')
+                    
+                    # ⚠️ بررسی شماره تکراری برای استخراج فایل زیپ ⚠️
+                    existing_link = await redis_client.get(f"phone_active_link:{phone}")
+                    if existing_link:
+                        links_text += f"📱 <b>شماره {phone}:</b>\n⚠️ تکراری (لینک از قبل موجود است)\n\n"
+                        continue
+
                     with open(file_path, 'r', encoding='utf-8') as f:
                         file_content = f.read()
                         data = json.loads(file_content)
@@ -442,12 +450,16 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 for item in origin.get('localStorage', []):
                                     if item.get('name') == 'tokenMS': access_token = item.get('value')
                                     elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
-                        phone = filename.replace('.json', '')
+                                    
                         if access_token and not await redis_client.exists(f"account:{phone}"):
                             await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
                         link_id = str(uuid.uuid4())[:12]
                         await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
                         final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                        
+                        # ثبت در سیستم تکراری‌ها
+                        await redis_client.setex(f"phone_active_link:{phone}", expire_time, final_url)
+                        
                         links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
                         count += 1
                 except Exception:
@@ -544,15 +556,12 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with open(discount_zip_path + '.zip', 'rb') as zip_file:
                     await context.bot.send_document(chat_id=user_id, document=zip_file, filename="Discounted_Accounts.zip", caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
                 
-                # 1. فایل گزارش تخفیف‌ها
                 links_out = io.BytesIO(links_text.encode('utf-8'))
                 await context.bot.send_document(chat_id=user_id, document=links_out, filename=f"Discount_Report_{ts}.txt", caption="✅ گزارش لینک‌های دارای تخفیف")
             else:
-                # 1. فایل گزارش تخفیف‌ها در صورت عدم تخفیف
                 report_out = io.BytesIO("هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.".encode('utf-8'))
                 await context.bot.send_document(chat_id=user_id, document=report_out, filename=f"Discount_Report_{ts}.txt", caption="⚠️ گزارش تخفیف‌ها (تخفیفی یافت نشد)")
                 
-            # 2. فایل لاگ‌های اکالا
             if debug_logs:
                 debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
                 await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Okala_Logs_{ts}.txt", caption="📄 گزارش لاگ‌های اکالا (API)")
@@ -590,7 +599,6 @@ def get_main_keyboard(is_admin_user, active_tag_name=None):
         InlineKeyboardButton("🔍 جستجوی لینک", callback_data="search_links")
     ])
     
-    # دکمه جدید برای بررسی تخفیف لینک‌ها
     keyboard.append([InlineKeyboardButton("🎁 بررسی تخفیف لینک‌ها", callback_data="check_user_links")])
     
     keyboard.append([InlineKeyboardButton("📞 تماس با مدیر", callback_data="contact_admin")])
@@ -729,9 +737,35 @@ async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYP
 async def ask_user_links_for_discount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     
-    # ✅ بررسی اینکه آیا کاربر مسدود است
-    if await is_user_blocked_for_discount(user_id):
-        await update.callback_query.answer("❌ دسترسی شما به این بخش محدود شده است.", show_alert=False)
+    if not await is_user_approved_for_discount(user_id):
+        pending_key = f"pending_req:discount:{user_id}"
+        
+        if await redis_client.exists(pending_key):
+            await update.callback_query.answer("⚠️ درخواست شما قبلاً برای ادمین ارسال شده است. لطفاً منتظر بمانید.", show_alert=True)
+            return ConversationHandler.END
+            
+        await redis_client.setex(pending_key, 86400, "1")
+        
+        tg_user = update.effective_user
+        admin_text = (
+            "👤 <b>درخواست دسترسی به چکر تخفیف</b>\n\n"
+            f"نام: {tg_user.full_name}\n"
+            f"یوزرنیم: @{tg_user.username or 'ندارد'}\n"
+            f"آیدی: <code>{user_id}</code>\n\n"
+            "آیا با دادن دسترسی به این کاربر موافقت می‌کنید؟"
+        )
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تایید دسترسی", callback_data=f"approve_discount_{user_id}")],
+            [InlineKeyboardButton("❌ رد درخواست", callback_data=f"deny_discount_{user_id}")]
+        ])
+        
+        try:
+            await context.bot.send_message(chat_id=MASTER_ADMIN_ID, text=admin_text, reply_markup=kb, parse_mode='HTML')
+        except Exception as e:
+            logging.error(f"Error sending request to Master Admin: {e}")
+            
+        await update.callback_query.answer("❌ شما به این بخش دسترسی ندارید. درخواست شما برای تایید به ادمین ارسال شد.", show_alert=True)
         return ConversationHandler.END
     
     await update.callback_query.answer()
@@ -747,15 +781,13 @@ async def ask_user_links_for_discount(update: Update, context: ContextTypes.DEFA
 async def process_user_links_discount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     
-    # ✅ بررسی دوباره اینکه آیا کاربر مسدود است
-    if await is_user_blocked_for_discount(user_id):
-        await update.message.reply_text("❌ دسترسی شما محدود شده است.")
+    if not await is_user_approved_for_discount(user_id):
+        await update.message.reply_text("❌ دسترسی شما به این بخش لغو شده است.")
         await show_main_menu(update, context)
         return ConversationHandler.END
     
     text = update.message.text.strip()
     
-    # پیدا کردن تمامی IDها در پیام کاربر
     found_ids = []
     lines = text.split('\n')
     for line in lines:
@@ -765,7 +797,6 @@ async def process_user_links_discount(update: Update, context: ContextTypes.DEFA
         if match:
             found_ids.append((line, match.group(1)))
         else:
-            # احتمال اینکه فقط آیدی را فرستاده باشند
             found_ids.append((line, line))
             
     if not found_ids:
@@ -839,7 +870,6 @@ async def process_user_links_discount(update: Update, context: ContextTypes.DEFA
 
     ts = int(time.time())
     
-    # 1. فایل گزارش تخفیف‌ها
     report_out = io.BytesIO(report.encode('utf-8'))
     await context.bot.send_document(
         chat_id=update.effective_user.id, 
@@ -848,7 +878,6 @@ async def process_user_links_discount(update: Update, context: ContextTypes.DEFA
         caption="✅ گزارش وضعیت تخفیف لینک‌ها"
     )
     
-    # 2. فایل لاگ‌های اکالا
     if api.request_logs:
         log_out = io.BytesIO("".join(api.request_logs).encode('utf-8'))
         await context.bot.send_document(
@@ -861,7 +890,6 @@ async def process_user_links_discount(update: Update, context: ContextTypes.DEFA
     await show_main_menu(update, context)
     return ConversationHandler.END
 
-
 # ==========================================
 # مدیریت دکمه‌های اصلی و ادمین
 # ==========================================
@@ -870,6 +898,32 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
     
+    if data.startswith("approve_discount_"):
+        if user_id != MASTER_ADMIN_ID:
+            await query.answer("❌ شما اجازه این کار را ندارید.", show_alert=True)
+            return
+        target_id = data.split("approve_discount_")[1]
+        await approve_user_for_discount(target_id)
+        await query.edit_message_text(f"✅ دسترسی کاربر <code>{target_id}</code> تایید شد.", parse_mode='HTML')
+        try:
+            await context.bot.send_message(chat_id=target_id, text="🎉 <b>درخواست شما تایید شد!</b>\nاکنون می‌توانید از دکمه بررسی تخفیف لینک‌ها استفاده کنید.", parse_mode='HTML')
+        except:
+            pass
+        return
+        
+    if data.startswith("deny_discount_"):
+        if user_id != MASTER_ADMIN_ID:
+            await query.answer("❌ شما اجازه این کار را ندارید.", show_alert=True)
+            return
+        target_id = data.split("deny_discount_")[1]
+        await remove_user_pending_req(target_id)
+        await query.edit_message_text(f"❌ درخواست کاربر <code>{target_id}</code> رد شد.", parse_mode='HTML')
+        try:
+            await context.bot.send_message(chat_id=target_id, text="❌ <b>متاسفانه درخواست دسترسی شما توسط ادمین رد شد.</b>", parse_mode='HTML')
+        except:
+            pass
+        return
+
     if data == "main_menu":
         await query.answer()
         context.user_data['admin_state'] = None
@@ -970,7 +1024,6 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(report_text, disable_web_page_preview=True, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="my_tags")]]))
         return
 
-    # === بخش مربوط به مدیریت ادمین ===
     if not is_admin(user_id): return
     await query.answer()
     
@@ -981,9 +1034,9 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_manage_users":
         await query.edit_message_text(
             "🚫 <b>مدیریت دسترسی کاربران:</b>\n\n"
-            "🔹 <b>/block @username</b> یا <b>/block userid</b> — مسدود کردن از دکمه بررسی تخفیف\n"
-            "🔹 <b>/unblock @username</b> یا <b>/unblock userid</b> — آزاد کردن دسترسی\n"
-            "🔹 <b>/blocklist</b> — مشاهده لیست کاربران مسدود\n\n"
+            "🔹 <b>/block @username</b> یا <b>/block userid</b> — مسدود کردن دسترسی تخفیف\n"
+            "🔹 <b>/unblock @username</b> یا <b>/unblock userid</b> — آزاد کردن دسترسی تخفیف\n"
+            "🔹 <b>/blocklist</b> — مشاهده لیست کاربرانی که تایید شده‌اند\n\n"
             "<b>مثال:</b>\n"
             "<code>/block @user123\n/block 7383838\n/unblock @user123</code>",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel")]]),
@@ -1005,9 +1058,8 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxies_json = await redis_client.get("settings:proxies")
         proxy_count = len(json.loads(proxies_json)) if proxies_json else 0
         
-        # شمارش کاربران مسدود
-        blocked_users = await redis_client.smembers("blocked_users:discount")
-        blocked_count = len(blocked_users) if blocked_users else 0
+        approved_users = await redis_client.smembers("approved_users:discount")
+        approved_count = len(approved_users) if approved_users else 0
         
         maint = await redis_client.get("settings:maintenance")
         exp = await redis_client.get("settings:expire_time")
@@ -1020,7 +1072,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 <b>تعداد کل اکانت‌ها:</b> <code>{len(acc_keys)}</code>\n"
             f"🔗 <b>لینک‌های فعال:</b> <code>{len(link_keys)}</code>\n"
             f"🌐 <b>تعداد پروکسی‌ها:</b> <code>{proxy_count}</code>\n"
-            f"🚫 <b>کاربران مسدود:</b> <code>{blocked_count}</code>\n"
+            f"✅ <b>کاربران تایید شده (تخفیف):</b> <code>{approved_count}</code>\n"
             f"⏳ <b>زمان انقضای لینک‌ها:</b> {exp_str}\n"
             f"🤖 <b>وضعیت ربات:</b> {status}"
         )
@@ -1216,7 +1268,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⚙️ <b>تغییر وضعیت سیستم:</b>\nوضعیت کنونی: {status}", reply_markup=get_admin_keyboard(), parse_mode='HTML')
 
 # ==========================================
-# دستورات بلاک/آنبلاک کردن کاربران
+# دستورات تغییر وضعیت تایید کاربران برای چکر
 # ==========================================
 async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -1225,10 +1277,10 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not context.args:
         await update.message.reply_text(
-            "🚫 <b>نحوه استفاده:</b>\n"
-            "<code>/block @username</code> یا <code>/block user_id</code>\n\n"
+            "🚫 <b>نحوه استفاده (لغو دسترسی):</b>\n"
+            "<code>/block user_id</code>\n\n"
             "<b>مثال:</b>\n"
-            "<code>/block @user123\n/block 7383838</code>",
+            "<code>/block 7383838</code>",
             parse_mode='HTML'
         )
         return
@@ -1236,23 +1288,20 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.args[0].strip()
     target_user_id = None
     
-    # اگر یوزرنیم است
     if target.startswith('@'):
-        await update.message.reply_text("⚠️ لطفاً از آیدی عددی استفاده کنید. دستور `/block user_id` را امتحان کنید.")
+        await update.message.reply_text("⚠️ لطفاً از آیدی عددی استفاده کنید.")
         return
     
-    # اگر ایدی عددی است
     if target.isdigit():
         target_user_id = int(target)
     else:
         await update.message.reply_text("❌ فرمت نامعتبر است. لطفاً آیدی عددی را ارسال کنید.")
         return
     
-    # مسدود کردن کاربر
-    await block_user_for_discount(target_user_id)
+    await redis_client.srem("approved_users:discount", str(target_user_id))
     
     await update.message.reply_text(
-        f"✅ کاربر <code>{target_user_id}</code> از دکمه بررسی تخفیف مسدود شد.",
+        f"✅ کاربر <code>{target_user_id}</code> از دسترسی به بررسی تخفیف محروم شد.",
         parse_mode='HTML'
     )
 
@@ -1263,7 +1312,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not context.args:
         await update.message.reply_text(
-            "🔓 <b>نحوه استفاده:</b>\n"
+            "🔓 <b>نحوه استفاده (اعطای دسترسی):</b>\n"
             "<code>/unblock user_id</code>\n\n"
             "<b>مثال:</b>\n"
             "<code>/unblock 7383838</code>",
@@ -1274,23 +1323,20 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.args[0].strip()
     target_user_id = None
     
-    # اگر یوزرنیم است
     if target.startswith('@'):
-        await update.message.reply_text("⚠️ لطفاً از آیدی عددی استفاده کنید. دستور `/unblock user_id` را امتحان کنید.")
+        await update.message.reply_text("⚠️ لطفاً از آیدی عددی استفاده کنید.")
         return
     
-    # اگر ایدی عددی است
     if target.isdigit():
         target_user_id = int(target)
     else:
         await update.message.reply_text("❌ فرمت نامعتبر است. لطفاً آیدی عددی را ارسال کنید.")
         return
     
-    # آزاد کردن کاربر
-    await unblock_user_for_discount(target_user_id)
+    await approve_user_for_discount(target_user_id)
     
     await update.message.reply_text(
-        f"✅ کاربر <code>{target_user_id}</code> دوباره دسترسی به بررسی تخفیف را دارد.",
+        f"✅ کاربر <code>{target_user_id}</code> دسترسی به چکر تخفیف را دریافت کرد.",
         parse_mode='HTML'
     )
 
@@ -1299,17 +1345,17 @@ async def blocklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ شما اجازه استفاده از این دستور را ندارید.")
         return
     
-    blocked_users = await redis_client.smembers("blocked_users:discount")
+    approved_users = await redis_client.smembers("approved_users:discount")
     
-    if not blocked_users:
-        await update.message.reply_text("✅ هیچ کاربر مسدود شده‌ای وجود ندارد.")
+    if not approved_users:
+        await update.message.reply_text("✅ هنوز هیچ کاربری برای بخش چکر تخفیف تایید نشده است.")
         return
     
-    report_text = "🚫 <b>لیست کاربران مسدود برای دکمه بررسی تخفیف:</b>\n\n"
-    for uid in sorted(blocked_users):
+    report_text = "✅ <b>لیست کاربرانی که به چکر تخفیف دسترسی دارند:</b>\n\n"
+    for uid in sorted(approved_users):
         report_text += f"• <code>{uid}</code>\n"
     
-    report_text += f"\n<b>تعداد کل:</b> {len(blocked_users)}"
+    report_text += f"\n<b>تعداد کل:</b> {len(approved_users)}"
     
     await update.message.reply_text(report_text, parse_mode='HTML')
 
@@ -1409,6 +1455,24 @@ async def cancel_process_callback(update: Update, context: ContextTypes.DEFAULT_
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
     phone = update.message.text.strip()
+    
+    # --- بررسی شماره تکراری ---
+    existing_link = await redis_client.get(f"phone_active_link:{phone}")
+    if existing_link:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")]
+        ])
+        await update.message.reply_text(
+            f"⚠️ <b>خطا: شماره تکراری!</b>\n\n"
+            f"برای شماره <code>{phone}</code> از قبل یک لینک فعال در سیستم وجود دارد:\n"
+            f"🔗 {existing_link}\n\n"
+            f"تا زمانی که لینک قبلی منقضی نشود، نمی‌توانید لینک جدیدی برای این شماره بسازید.",
+            reply_markup=kb,
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    # --------------------------
+    
     context.user_data['phone'] = phone
     
     url = "https://apigateway.okala.com/api/voyager/C/CustomerAccount/OTPRegister"
@@ -1504,6 +1568,9 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     
     final_url = f"{WEB_DOMAIN}/acc/{link_id}"
     
+    # ⚠️ ثبت لینک فعال برای شماره جهت جلوگیری از تکرار ⚠️
+    await redis_client.setex(f"phone_active_link:{phone}", expire_time, final_url)
+    
     if 'session_links' not in context.user_data:
         context.user_data['session_links'] = []
     context.user_data['session_links'].append({"phone": phone, "link": final_url})
@@ -1598,7 +1665,7 @@ async def main():
     )
     application.add_handler(conv_handler)
     
-    application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$|^finish_link_creation$|^my_tags$|^show_tag_|^contact_admin$"))
+    application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^set_exp_|^main_menu$|^admin_panel$|^finish_link_creation$|^my_tags$|^show_tag_|^contact_admin$|^approve_discount_|^deny_discount_"))
     
     application.add_handler(MessageHandler(filters.TEXT | filters.Document.FileExtension("txt"), handle_admin_text_document))
 
